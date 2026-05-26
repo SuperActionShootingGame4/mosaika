@@ -1,0 +1,65 @@
+# モデルファイル
+*.pt
+*.pth
+*.onnx
+*.weights
+*.bin
+*.safetensors
+*.pkl
+*.h5
+*.tflite
+*.torchscript
+
+# Python 環境
+.venv/
+venv/
+env/
+.env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 動画・画像の入出力ファイル
+douga/
+input/
+output/
+*.mp4
+*.MP4
+*.avi
+*.mov
+*.MOV
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+
+# ログ・一時ファイル
+*.log
+*.log.txt
+*.tmp
+*.cache
+.DS_Store
+Thumbs.db
+
+# IDE・エディタ
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
