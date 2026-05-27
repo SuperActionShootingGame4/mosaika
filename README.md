@@ -85,6 +85,9 @@ python mosaic_censor.py input.mp4 --pre --frames 6900-7100 --pose-model rtmpose 
 # CSVだけを渡して、元動画から清書 post 動画を作る
 python mosaic_censor.py input_frames6900-7100_pre.csv --post
 
+# _pre.csv をGUIで編集する
+python pre_csv_editor.py input_frames6900-7100_pre.csv
+
 # デバッグ動画を出力（骨格・検出ボックス表示）
 python mosaic_censor.py input.mp4 --debug
 

@@ -3,6 +3,7 @@ opencv-python>=4.8.0
 tqdm>=4.65.0
 numpy>=1.24.0
 ultralytics>=8.3.0
+PyQt6>=6.6.0
 # --pose-model vitpose-h を使う場合は追加インストールが必要:
 # pip install transformers Pillow
 # --pose-model rtmpose を使う場合は追加インストールが必要:
