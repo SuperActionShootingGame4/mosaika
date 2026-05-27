@@ -334,6 +334,29 @@ def box_overlaps_any(
     return any(boxes_overlap(box, cb) for cb in crotch_boxes)
 
 
+def crotch_center(crotch_box: tuple[int, int, int, int]) -> tuple[int, int]:
+    return ((crotch_box[0] + crotch_box[2]) // 2, (crotch_box[1] + crotch_box[3]) // 2)
+
+
+def find_crotch_match(
+    box: tuple[int, int, int, int],
+    crotch_boxes: list[tuple[int, int, int, int]],
+) -> tuple[int, tuple[int, int]] | None:
+    """モザイクboxに対応するcrotch番号（1始まり）と中心座標を返す。"""
+    box_cx, box_cy = box_center(box)
+    best: tuple[int, tuple[int, int], float] | None = None
+    for idx, crotch_box in enumerate(crotch_boxes, start=1):
+        if not boxes_overlap(box, crotch_box):
+            continue
+        cx, cy = crotch_center(crotch_box)
+        distance = (cx - box_cx) ** 2 + (cy - box_cy) ** 2
+        if best is None or distance < best[2]:
+            best = (idx, (cx, cy), distance)
+    if best is None:
+        return None
+    return best[0], best[1]
+
+
 def clip_to_crotch_box(
     box: tuple[int, int, int, int],
     crotch_boxes: list[tuple[int, int, int, int]],
@@ -591,6 +614,8 @@ def mosaic_csv_header() -> list[str]:
         header.extend([
             f"mosaic{i}_on",
             f"mosaic{i}_type",
+            f"mosaic{i}_crotch_no",
+            f"mosaic{i}_crotch_center",
             f"mosaic{i}_x1",
             f"mosaic{i}_y1",
             f"mosaic{i}_x2",
@@ -602,6 +627,7 @@ def mosaic_csv_header() -> list[str]:
 def mosaic_csv_row(
     frame_idx: int,
     boxes: list[tuple[tuple[int, int, int, int], str]],
+    crotch_boxes: list[tuple[int, int, int, int]],
 ) -> dict[str, str | int]:
     row: dict[str, str | int] = {
         "frame_no": frame_idx,
@@ -610,6 +636,8 @@ def mosaic_csv_row(
     for i in range(1, MAX_CSV_MOSAICS + 1):
         row[f"mosaic{i}_on"] = "0"
         row[f"mosaic{i}_type"] = ""
+        row[f"mosaic{i}_crotch_no"] = ""
+        row[f"mosaic{i}_crotch_center"] = ""
         row[f"mosaic{i}_x1"] = ""
         row[f"mosaic{i}_y1"] = ""
         row[f"mosaic{i}_x2"] = ""
@@ -618,6 +646,11 @@ def mosaic_csv_row(
     for i, (box, label) in enumerate(boxes[:MAX_CSV_MOSAICS], start=1):
         row[f"mosaic{i}_on"] = "1"
         row[f"mosaic{i}_type"] = label
+        crotch_match = find_crotch_match(box, crotch_boxes)
+        if crotch_match:
+            crotch_no, (crotch_cx, crotch_cy) = crotch_match
+            row[f"mosaic{i}_crotch_no"] = crotch_no
+            row[f"mosaic{i}_crotch_center"] = f"{crotch_cx},{crotch_cy}"
         row[f"mosaic{i}_x1"] = box[0]
         row[f"mosaic{i}_y1"] = box[1]
         row[f"mosaic{i}_x2"] = box[2]
@@ -776,7 +809,7 @@ def process_video(
         if debug_writer:
             debug_writer.write(dbg)
         if csv_writer:
-            csv_writer.writerow(mosaic_csv_row(fidx, apply_bxs))
+            csv_writer.writerow(mosaic_csv_row(fidx, apply_bxs, srch_bxs))
 
     def _flush_pending(force: bool = False) -> None:
         nonlocal pending_frames, previous_positive_boxes, previous_positive_idx
