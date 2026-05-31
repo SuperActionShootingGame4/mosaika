@@ -16,7 +16,9 @@ from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, Q
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -25,6 +27,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -70,10 +73,22 @@ def write_pre_csv(path: Path, data: CsvData) -> None:
             dict_writer.writerow(row)
 
 
-def infer_pre_video_path(csv_path: Path) -> Path:
-    if csv_path.name.endswith("_pre.csv"):
-        return csv_path.with_suffix(".mp4")
-    return csv_path.with_name(f"{csv_path.stem}.mp4")
+def set_meta_value(data: CsvData, key: str, value: str) -> None:
+    for row in data.meta:
+        if row and row[0] == key:
+            if len(row) >= 2:
+                row[1] = value
+            else:
+                row.append(value)
+            return
+    data.meta.append([key, value])
+
+
+def source_video_path(data: CsvData) -> Path:
+    source_video = data.meta_dict.get("source_video", "").strip()
+    if not source_video:
+        raise RuntimeError("CSVに source_video がありません")
+    return Path(source_video)
 
 
 def is_on(value: str | None) -> bool:
@@ -337,9 +352,9 @@ class EditorWindow(QMainWindow):
         self.csv_path = csv_path
         self.data = read_pre_csv(csv_path)
         self.original_rows = [dict(row) for row in self.data.rows]
-        self.video_path = infer_pre_video_path(csv_path)
+        self.video_path = source_video_path(self.data)
         if not self.video_path.is_file():
-            raise RuntimeError(f"_pre.mp4 が見つかりません: {self.video_path}")
+            raise RuntimeError(f"元動画が見つかりません: {self.video_path}")
         self.cap = cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
             raise RuntimeError(f"動画を開けません: {self.video_path}")
@@ -397,6 +412,12 @@ class EditorWindow(QMainWindow):
         next_page_action.triggered.connect(self.next_frame)
         self.addAction(next_page_action)
 
+        delete_mosaic_action = QAction("選択モザイクを削除", self)
+        delete_mosaic_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        delete_mosaic_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        delete_mosaic_action.triggered.connect(self.disable_selected)
+        self.addAction(delete_mosaic_action)
+
         splitter = QSplitter()
         self.setCentralWidget(splitter)
 
@@ -423,6 +444,24 @@ class EditorWindow(QMainWindow):
         self.info_label = QLabel(f"CSV: {self.csv_path}\nVideo: {self.video_path}")
         self.info_label.setWordWrap(True)
         right_layout.addWidget(self.info_label)
+
+        meta = self.data.meta_dict
+        meta_layout = QFormLayout()
+        self.effect_combo = QComboBox()
+        self.effect_combo.addItems(["mosaic", "blur"])
+        self.effect_combo.setCurrentText(meta.get("effect", "mosaic"))
+        self.intensity_spin = QSpinBox()
+        self.intensity_spin.setRange(1, 2147483647)
+        try:
+            intensity = int(meta.get("intensity", "15"))
+        except ValueError:
+            intensity = 15
+        self.intensity_spin.setValue(max(1, intensity))
+        meta_layout.addRow("intensity", self.intensity_spin)
+        meta_layout.addRow("effect", self.effect_combo)
+        for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch"):
+            meta_layout.addRow(key, QLabel(meta.get(key, "")))
+        right_layout.addLayout(meta_layout)
 
         self.frame_table = QTableWidget(len(self.data.rows), 4)
         self.frame_table.setHorizontalHeaderLabels(
@@ -471,6 +510,8 @@ class EditorWindow(QMainWindow):
         self.create_from_nearest_button.clicked.connect(self.create_from_nearest)
         self.on_checkbox.stateChanged.connect(self.toggle_selected)
         self.preview_checkbox.stateChanged.connect(self.refresh_canvas_frame)
+        self.effect_combo.currentTextChanged.connect(self.update_preview_meta)
+        self.intensity_spin.valueChanged.connect(self.update_preview_meta)
         self.type_input.editingFinished.connect(self.update_selected_type)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
@@ -487,19 +528,24 @@ class EditorWindow(QMainWindow):
             self.setWindowTitle(self.windowTitle() + " *")
 
     def load_frame(self) -> None:
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_index)
+        frame_no_text = self.current_row().get("frame_no", "")
+        try:
+            frame_no = int(frame_no_text)
+        except ValueError:
+            QMessageBox.warning(self, "Error", f"frame_no が不正です: {frame_no_text}")
+            return
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
         ok, frame = self.cap.read()
         if not ok:
-            QMessageBox.warning(self, "Error", f"フレームを読めません: index={self.current_index}")
+            QMessageBox.warning(self, "Error", f"フレームを読めません: frame_no={frame_no}")
             return
         self.source_frame = frame
         h, w = frame.shape[:2]
         self.image_width = w
         self.image_height = h
         self.refresh_canvas_frame()
-        frame_no = self.current_row().get("frame_no", "")
         self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}  frame_no={frame_no}")
-        self.frame_input.setText(frame_no)
+        self.frame_input.setText(str(frame_no))
         if get_rect(self.current_row(), self.selected_slot) is None:
             self.populate_selected_from_nearest(on=False)
         self.select_current_frame_row()
@@ -526,6 +572,12 @@ class EditorWindow(QMainWindow):
         h, w = rgb.shape[:2]
         qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
         self.canvas.set_frame(QPixmap.fromImage(qimg), (w, h))
+
+    def update_preview_meta(self, *args) -> None:
+        set_meta_value(self.data, "effect", self.effect_combo.currentText())
+        set_meta_value(self.data, "intensity", str(self.intensity_spin.value()))
+        self.mark_dirty()
+        self.refresh_canvas_frame()
 
     def populate_frame_table(self) -> None:
         self.frame_table.blockSignals(True)
@@ -747,10 +799,7 @@ class EditorWindow(QMainWindow):
         QMessageBox.information(self, "Not found", f"frame_no={wanted} はCSVにありません")
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Delete:
-            self.disable_selected()
-        else:
-            super().keyPressEvent(event)
+        super().keyPressEvent(event)
 
     def save_with_confirm(self, *args) -> None:
         if QMessageBox.question(self, "保存確認", f"{self.csv_path} を上書き保存しますか？") != QMessageBox.StandardButton.Yes:

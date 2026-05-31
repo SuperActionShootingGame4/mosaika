@@ -60,7 +60,7 @@ python pre_csv_editor.py  # ファイル選択ダイアログが開く
 ### pre/post ワークフロー
 
 - `--pre`: 通常の検出処理 ＋ `_pre.mp4`（モザイク済み確認用）と `_pre.csv`（フレームごとのモザイク座標）を出力
-- `pre_csv_editor.py`: `_pre.mp4` を横に映しながら CSV のモザイク矩形を GUI で追加・修正
+- `pre_csv_editor.py`: CSV の `source_video` にある元動画を横に映しながら CSV のモザイク矩形を GUI で追加・修正
 - `--post`: CSV のメタデータから `source_video`・`intensity` などを読み取り、`_post.mp4` を生成
 
 ### CSV フォーマット
