@@ -18,7 +18,7 @@ python3 -m venv .venv
 Run the tool through the wrapper:
 
 ```bash
-./run.sh douga/input.MP4 --block-size 15 --confidence 0.25
+./run.sh douga/input.MP4 --intensity 15 --confidence 0.25
 ```
 
 Process one frame for faster debugging:

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-mosaic_censor.py - MP4動画の性器にモザイクをかけるツール
+mosaic_censor.py - MP4動画の性器にモザイクまたはぼかしをかけるツール
 
 使い方:
   python mosaic_censor.py input.mp4
-  python mosaic_censor.py input.mp4 --block-size 20
+  python mosaic_censor.py input.mp4 --effect blur
+  python mosaic_censor.py input.mp4 --intensity 20
   python mosaic_censor.py input.mp4 --confidence 0.25
 """
 
@@ -59,6 +60,7 @@ YOLO_LABEL_SHORT: dict[str, str] = {
 }
 
 POSE_BACKENDS = ("yolo11", "yolo8", "vitpose-h", "rtmpose", "rtmpose-wholebody")
+CENSOR_EFFECTS = ("mosaic", "blur")
 MAX_CSV_MOSAICS = 255
 
 
@@ -110,17 +112,46 @@ def load_pose_model(backend: str):
         raise ValueError(f"未知のポーズモデル: {backend}（選択肢: {POSE_BACKENDS}）")
 
 
-def apply_mosaic(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, block_size: int) -> np.ndarray:
+def apply_mosaic(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, intensity: int) -> np.ndarray:
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return frame
     h, w = roi.shape[:2]
-    small = cv2.resize(roi, (max(1, w // block_size), max(1, h // block_size)),
+    small = cv2.resize(roi, (max(1, w // intensity), max(1, h // intensity)),
                        interpolation=cv2.INTER_LINEAR)
     mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
     result = frame.copy()
     result[y1:y2, x1:x2] = mosaic
     return result
+
+
+def apply_blur(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, intensity: int) -> np.ndarray:
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return frame
+    kernel_size = intensity if intensity % 2 == 1 else intensity + 1
+    blurred = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
+    result = frame.copy()
+    result[y1:y2, x1:x2] = blurred
+    return result
+
+
+def apply_censor_effect(
+    frame: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    intensity: int,
+    effect: str,
+) -> np.ndarray:
+    if intensity < 1:
+        raise ValueError("intensity は1以上で指定してください")
+    if effect == "blur":
+        return apply_blur(frame, x1, y1, x2, y2, intensity)
+    if effect == "mosaic":
+        return apply_mosaic(frame, x1, y1, x2, y2, intensity)
+    raise ValueError(f"未知のエフェクト: {effect}")
 
 
 def _crotch_box_from_hips(
@@ -374,15 +405,17 @@ def clip_to_crotch_box(
 def filter_by_crotch(
     nudenet_boxes_with_score: list[tuple[tuple[int, int, int, int], float, str]],
     crotch_boxes: list[tuple[int, int, int, int]],
+    enabled: bool = True,
 ) -> list[tuple[tuple[int, int, int, int], str]]:
     """
-    検出矩形が crotch 矩形と重なる場合だけ採用する。
+    有効時は、検出矩形が crotch 矩形と重なる場合だけ採用する。
+    無効時は、受け取った検出矩形をすべて採用する。
     モザイク対象は検出器が返した矩形そのもの。
     """
     result: list[tuple[tuple[int, int, int, int], str]] = []
     for box, score, label in nudenet_boxes_with_score:
         short = LABEL_SHORT.get(label, label)
-        if crotch_boxes and box_overlaps_any(box, crotch_boxes):
+        if not enabled or (crotch_boxes and box_overlaps_any(box, crotch_boxes)):
             result.append((box, short))
     return result
 
@@ -609,11 +642,12 @@ def merge_audio_from_source(
 
 
 def mosaic_csv_header() -> list[str]:
-    header = ["frame_no", "checked"]
+    header = ["frame_no", "nsfw_detection_count", "crotch_detected", "comment"]
     for i in range(1, MAX_CSV_MOSAICS + 1):
         header.extend([
             f"mosaic{i}_on",
             f"mosaic{i}_type",
+            f"mosaic{i}_score",
             f"mosaic{i}_crotch_no",
             f"mosaic{i}_crotch_center",
             f"mosaic{i}_x1",
@@ -628,14 +662,19 @@ def mosaic_csv_row(
     frame_idx: int,
     boxes: list[tuple[tuple[int, int, int, int], str]],
     crotch_boxes: list[tuple[int, int, int, int]],
+    nsfw_detection_count: int = 0,
+    detector_boxes: list[tuple[tuple[int, int, int, int], float, str]] | None = None,
 ) -> dict[str, str | int]:
     row: dict[str, str | int] = {
         "frame_no": frame_idx,
-        "checked": "",
+        "nsfw_detection_count": nsfw_detection_count,
+        "crotch_detected": "1" if crotch_boxes else "0",
+        "comment": "",
     }
     for i in range(1, MAX_CSV_MOSAICS + 1):
         row[f"mosaic{i}_on"] = "0"
         row[f"mosaic{i}_type"] = ""
+        row[f"mosaic{i}_score"] = ""
         row[f"mosaic{i}_crotch_no"] = ""
         row[f"mosaic{i}_crotch_center"] = ""
         row[f"mosaic{i}_x1"] = ""
@@ -646,6 +685,12 @@ def mosaic_csv_row(
     for i, (box, label) in enumerate(boxes[:MAX_CSV_MOSAICS], start=1):
         row[f"mosaic{i}_on"] = "1"
         row[f"mosaic{i}_type"] = label
+        matching_scores = [
+            score for detected_box, score, _ in detector_boxes or []
+            if detected_box == box
+        ]
+        if matching_scores:
+            row[f"mosaic{i}_score"] = f"{max(matching_scores):.2f}"
         crotch_match = find_crotch_match(box, crotch_boxes)
         if crotch_match:
             crotch_no, (crotch_cx, crotch_cy) = crotch_match
@@ -659,7 +704,7 @@ def mosaic_csv_row(
 
 
 def csv_on(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "on", "yes", "y"}
+    return (value or "").strip().lower() in {"1", "true", "t", "on", "yes", "y"}
 
 
 def boxes_from_csv_row(row: dict[str, str]) -> list[tuple[int, int, int, int]]:
@@ -684,7 +729,8 @@ def boxes_from_csv_row(row: dict[str, str]) -> list[tuple[int, int, int, int]]:
 def process_video(
     input_path: str,
     output_path: str,
-    block_size: int,
+    intensity: int,
+    effect: str,
     confidence: float,
     detect_every: int,
     log_file=None,
@@ -695,6 +741,7 @@ def process_video(
     max_interpolate_gap: int = 10,
     frame_range: tuple[int, int] | None = None,
     pose_backend: str = "yolo11",
+    no_crotch: bool = False,
     csv_path: str | None = None,
     render_debug_to_output: bool = False,
 ) -> None:
@@ -765,6 +812,7 @@ def process_video(
     last_search_boxes: list[tuple[int, int, int, int]] = []
     last_nudenet_boxes: list = []
     last_new_boxes: list[tuple[tuple[int, int, int, int], str]] = []
+    last_nsfw_detection_count = 0
     last_pose_kps: list[np.ndarray] = []
 
     pending_frames: list[dict] = []
@@ -777,13 +825,15 @@ def process_video(
         csv_file = open(csv_path, "w", encoding="utf-8", newline="")
         meta = csv.writer(csv_file)
         meta.writerow(["source_video",    resolved_input_path])
-        meta.writerow(["block_size",      block_size])
+        meta.writerow(["intensity",       intensity])
+        meta.writerow(["effect",          effect])
         meta.writerow(["confidence",      confidence])
         meta.writerow(["pose_model",      pose_backend])
         meta.writerow(["yolo_nsfw_model", yolo_nsfw_model_path or ""])
         meta.writerow(["yolo_confidence", yolo_confidence])
         meta.writerow(["detect_every",    detect_every])
         meta.writerow(["interpolate_gap", max_interpolate_gap])
+        meta.writerow(["no_crotch",        int(no_crotch)])
         csv_writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header())
         csv_writer.writeheader()
 
@@ -794,11 +844,12 @@ def process_video(
         srch_bxs: list[tuple[int, int, int, int]],
         nnet_bxs: list,
         nw_bxs: list[tuple[tuple[int, int, int, int], str]],
+        nsfw_detection_count: int,
         fidx: int,
     ) -> None:
         res = frm.copy()
         for box, _ in apply_bxs:
-            res = apply_mosaic(res, *box, block_size)
+            res = apply_censor_effect(res, *box, intensity, effect)
         if render_debug_to_output or debug_writer:
             dbg = draw_debug_frame(res, pose_res, srch_bxs, nnet_bxs,
                                    confidence, nw_bxs, apply_bxs, fidx)
@@ -809,7 +860,9 @@ def process_video(
         if debug_writer:
             debug_writer.write(dbg)
         if csv_writer:
-            csv_writer.writerow(mosaic_csv_row(fidx, apply_bxs, srch_bxs))
+            csv_writer.writerow(mosaic_csv_row(
+                fidx, apply_bxs, srch_bxs, nsfw_detection_count, nnet_bxs
+            ))
 
     def _flush_pending(force: bool = False) -> None:
         nonlocal pending_frames, previous_positive_boxes, previous_positive_idx
@@ -840,10 +893,11 @@ def process_video(
                         f"(frame {previous_positive_idx} and frame {current['idx']} both detected)"
                     )
                 _write_out(rec["frame"], apply_boxes, rec["pose"], rec["search"],
-                           rec["nudenet"], rec["new_boxes"], rec["idx"])
+                           rec["nudenet"], rec["new_boxes"], rec["nsfw_detection_count"],
+                           rec["idx"])
             _write_out(current["frame"], current["new_boxes"], current["pose"],
                        current["search"], current["nudenet"], current["new_boxes"],
-                       current["idx"])
+                       current["nsfw_detection_count"], current["idx"])
             previous_positive_boxes = current["new_boxes"]
             previous_positive_idx = current["idx"]
             pending_frames = []
@@ -855,7 +909,8 @@ def process_video(
         flush_count = len(pending_frames) if force else 1
         for rec in pending_frames[:flush_count]:
             _write_out(rec["frame"], rec["new_boxes"], rec["pose"], rec["search"],
-                       rec["nudenet"], rec["new_boxes"], rec["idx"])
+                       rec["nudenet"], rec["new_boxes"], rec["nsfw_detection_count"],
+                       rec["idx"])
         pending_frames = pending_frames[flush_count:]
 
     try:
@@ -895,11 +950,15 @@ def process_video(
                         ]
                         nudenet_adopted = [
                             (box, f"NudeNet {short_label}")
-                            for box, short_label in filter_by_crotch(nudenet_boxes_conf, search_boxes)
+                            for box, short_label in filter_by_crotch(
+                                nudenet_boxes_conf, search_boxes, enabled=not no_crotch
+                            )
                         ]
                         yolo_adopted = [
                             (box, short_label)
-                            for box, short_label in filter_by_crotch(yolo_boxes_conf, search_boxes)
+                            for box, short_label in filter_by_crotch(
+                                yolo_boxes_conf, search_boxes, enabled=not no_crotch
+                            )
                         ]
                         new_boxes = merge_adopted_boxes(
                             nudenet_adopted + yolo_adopted
@@ -909,6 +968,8 @@ def process_video(
                         last_search_boxes = search_boxes
                         last_nudenet_boxes = all_detector_boxes
                         last_new_boxes = new_boxes
+                        nsfw_detection_count = len(nudenet_boxes_conf) + len(yolo_boxes_conf)
+                        last_nsfw_detection_count = nsfw_detection_count
                         last_pose_kps = pose_kps
 
                         _log(
@@ -933,14 +994,15 @@ def process_video(
                         pending_frames.append({
                             'frame': frame, 'idx': frame_idx, 'new_boxes': new_boxes,
                             'search': search_boxes, 'nudenet': all_detector_boxes,
-                            'pose': pose_kps,
+                            'pose': pose_kps, 'nsfw_detection_count': nsfw_detection_count,
                         })
                         _flush_pending()
 
                     else:
                         _flush_pending(force=True)
                         _write_out(frame, last_boxes, last_pose_kps, last_search_boxes,
-                                   last_nudenet_boxes, last_new_boxes, frame_idx)
+                                   last_nudenet_boxes, last_new_boxes,
+                                   last_nsfw_detection_count, frame_idx)
 
                     frame_idx += 1
                     pbar.update(1)
@@ -963,13 +1025,15 @@ def process_video(
 def process_single_frame(
     input_path: str,
     frame_number: int,
-    block_size: int,
+    intensity: int,
+    effect: str,
     confidence: float,
     log_file=None,
     debug: bool = False,
     yolo_nsfw_model_path: str | None = None,
     yolo_confidence: float = 0.03,
     pose_backend: str = "yolo11",
+    no_crotch: bool = False,
 ) -> None:
     def _log(msg: str) -> None:
         if log_file:
@@ -1038,18 +1102,22 @@ def process_single_frame(
         ]
         nudenet_adopted = [
             (box, f"NudeNet {short_label}")
-            for box, short_label in filter_by_crotch(nudenet_boxes_conf, search_boxes)
+            for box, short_label in filter_by_crotch(
+                nudenet_boxes_conf, search_boxes, enabled=not no_crotch
+            )
         ]
         yolo_adopted = [
             (box, short_label)
-            for box, short_label in filter_by_crotch(yolo_boxes_conf, search_boxes)
+            for box, short_label in filter_by_crotch(
+                yolo_boxes_conf, search_boxes, enabled=not no_crotch
+            )
         ]
         new_boxes = merge_adopted_boxes(nudenet_adopted + yolo_adopted)
         all_detector_boxes = all_nudenet_boxes + yolo_boxes
 
     result = frame.copy()
     for box, _ in new_boxes:
-        result = apply_mosaic(result, *box, block_size)
+        result = apply_censor_effect(result, *box, intensity, effect)
 
     cv2.imwrite(str(source_path), frame)
     cv2.imwrite(str(censored_path), result)
@@ -1115,6 +1183,7 @@ def process_post_from_csv(
     csv_path: str,
     output_path: str | None,
     log_file=None,
+    effect_override: str | None = None,
 ) -> None:
     def _log(msg: str) -> None:
         if log_file:
@@ -1132,9 +1201,12 @@ def process_post_from_csv(
         raise RuntimeError(f"CSVの source_video が見つかりません: {source_video}")
 
     try:
-        block_size = int(meta.get("block_size", "15"))
+        intensity = int(meta.get("intensity", "15"))
     except ValueError:
-        block_size = 15
+        intensity = 15
+    effect = effect_override or meta.get("effect", "mosaic")
+    if effect not in CENSOR_EFFECTS:
+        raise RuntimeError(f"CSVの effect が不正です: {effect}")
 
     if not rows:
         raise RuntimeError(f"CSVにフレーム行がありません: {csv_path}")
@@ -1172,7 +1244,7 @@ def process_post_from_csv(
                 current_pos = frame_idx + 1
 
                 for box in boxes_from_csv_row(row):
-                    frame = apply_mosaic(frame, *box, block_size)
+                    frame = apply_censor_effect(frame, *box, intensity, effect)
                 writer.write(frame)
                 pbar.update(1)
     finally:
@@ -1202,19 +1274,27 @@ def parse_frame_range(value: str) -> tuple[int, int]:
     return start, end
 
 
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("1以上で指定してください")
+    return number
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MP4動画の性器にモザイクをかけるツール（Pose + NudeNet 二段フィルタ）",
+        description="MP4動画の性器にモザイクまたはぼかしをかけるツール（Pose + NudeNet 二段フィルタ）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 仕組み:
   1. YOLOv8 Pose で腰骨から股間エリアを特定
   2. NudeNet で3クロップ検出
-  3. 股間エリア内の検出のみ採用（手・脇など誤検出を排除）
+  3. 通常は股間エリア内の検出のみ採用（--no-crotch で領域チェックを無効化）
 
 例:
   python mosaic_censor.py input.mp4
-  python mosaic_censor.py input.mp4 --block-size 20
+  python mosaic_censor.py input.mp4 --effect blur
+  python mosaic_censor.py input.mp4 --intensity 20
   python mosaic_censor.py input.mp4 --confidence 0.25
         """,
     )
@@ -1223,8 +1303,10 @@ def main() -> None:
                         help="目視確認用の _pre.mp4 と編集用CSVを作成する")
     parser.add_argument("--post", action="store_true",
                         help="CSVを読み込み、source_video から _post.mp4 を作成する")
-    parser.add_argument("--block-size", type=int, default=15, metavar="N",
-                        help="モザイクのブロックサイズ (デフォルト: 15)")
+    parser.add_argument("--intensity", type=positive_int, default=15, metavar="N",
+                        help="モザイクまたはぼかしの強度 (デフォルト: 15)")
+    parser.add_argument("--effect", choices=list(CENSOR_EFFECTS), default=None,
+                        help="適用するエフェクト: mosaic または blur (デフォルト: mosaic)")
     parser.add_argument("--confidence", type=float, default=0.03, metavar="F",
                         help="NudeNet の信頼度閾値 (デフォルト: 0.03)")
     parser.add_argument("--detect-every", type=int, default=1, metavar="N",
@@ -1233,6 +1315,8 @@ def main() -> None:
                         help="ポーズスケルトン・検出ボックスを描画したデバッグ動画を出力")
     parser.add_argument("--no-interpolate", action="store_true",
                         help="前後フレーム補間を無効化 (デフォルト: 有効)")
+    parser.add_argument("--no-crotch", action="store_true",
+                        help="股間領域との重なりチェックを無効化し、しきい値以上の性器検出をすべて採用")
     parser.add_argument("--yolo-nsfw-model", default=None,
                         help="追加で使うYOLO NSFWモデル(.pt)のパス (デフォルト: 無効)")
     parser.add_argument("--yolo-confidence", type=float, default=None, metavar="F",
@@ -1252,6 +1336,7 @@ def main() -> None:
 
     args = parser.parse_args()
     check_ffmpeg()
+    effect = args.effect or "mosaic"
 
     if not os.path.isfile(args.input):
         print(f"エラー: ファイルが見つかりません: {args.input}", file=sys.stderr)
@@ -1289,6 +1374,7 @@ def main() -> None:
                     csv_path=args.input,
                     output_path=output_path,
                     log_file=lf,
+                    effect_override=args.effect,
                 )
             except KeyboardInterrupt:
                 print("\n中断されました", file=sys.stderr)
@@ -1304,8 +1390,10 @@ def main() -> None:
             log(f"入力          : {args.input}", lf)
             log(f"ログ          : {log_path}", lf)
             log(f"単発フレーム  : {args.frame}", lf)
-            log(f"ブロックサイズ : {args.block_size}", lf)
+            log(f"強度          : {args.intensity}", lf)
+            log(f"エフェクト     : {effect}", lf)
             log(f"信頼度閾値    : {args.confidence}", lf)
+            log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
             log(f"ポーズモデル  : {args.pose_model}", lf)
             log(f"YOLO NSFW     : {args.yolo_nsfw_model or '無効'}", lf)
             if args.yolo_nsfw_model:
@@ -1315,13 +1403,15 @@ def main() -> None:
                 process_single_frame(
                     input_path=args.input,
                     frame_number=args.frame,
-                    block_size=args.block_size,
+                    intensity=args.intensity,
+                    effect=effect,
                     confidence=args.confidence,
                     log_file=lf,
                     debug=args.debug,
                     yolo_nsfw_model_path=args.yolo_nsfw_model,
                     yolo_confidence=yolo_confidence,
                     pose_backend=args.pose_model,
+                    no_crotch=args.no_crotch,
                 )
                 log("\n完了", lf)
             except KeyboardInterrupt:
@@ -1344,8 +1434,10 @@ def main() -> None:
             log(f"pre動画       : {output_path}", lf)
             log(f"CSV           : {csv_path}", lf)
             log(f"ログ          : {log_path}", lf)
-            log(f"ブロックサイズ : {args.block_size}", lf)
+            log(f"強度          : {args.intensity}", lf)
+            log(f"エフェクト     : {effect}", lf)
             log(f"信頼度閾値    : {args.confidence}", lf)
+            log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
             log(f"ポーズモデル  : {args.pose_model}", lf)
             log(f"YOLO NSFW     : {args.yolo_nsfw_model or '無効'}", lf)
             if args.yolo_nsfw_model:
@@ -1360,7 +1452,8 @@ def main() -> None:
                 process_video(
                     input_path=args.input,
                     output_path=output_path,
-                    block_size=args.block_size,
+                    intensity=args.intensity,
+                    effect=effect,
                     confidence=args.confidence,
                     detect_every=args.detect_every,
                     log_file=lf,
@@ -1371,6 +1464,7 @@ def main() -> None:
                     max_interpolate_gap=args.interpolate_gap,
                     frame_range=args.frames,
                     pose_backend=args.pose_model,
+                    no_crotch=args.no_crotch,
                     csv_path=csv_path,
                     render_debug_to_output=True,
                 )
@@ -1393,8 +1487,10 @@ def main() -> None:
         log(f"ログ          : {log_path}", lf)
         if debug_path:
             log(f"デバッグ動画  : {debug_path}", lf)
-        log(f"ブロックサイズ : {args.block_size}", lf)
+        log(f"強度          : {args.intensity}", lf)
+        log(f"エフェクト     : {effect}", lf)
         log(f"信頼度閾値    : {args.confidence}", lf)
+        log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
         log(f"ポーズモデル  : {args.pose_model}", lf)
         log(f"YOLO NSFW     : {args.yolo_nsfw_model or '無効'}", lf)
         if args.yolo_nsfw_model:
@@ -1409,7 +1505,8 @@ def main() -> None:
             process_video(
                 input_path=args.input,
                 output_path=output_path,
-                block_size=args.block_size,
+                intensity=args.intensity,
+                effect=effect,
                 confidence=args.confidence,
                 detect_every=args.detect_every,
                 log_file=lf,
@@ -1420,6 +1517,7 @@ def main() -> None:
                 max_interpolate_gap=args.interpolate_gap,
                 frame_range=args.frames,
                 pose_backend=args.pose_model,
+                no_crotch=args.no_crotch,
             )
             log(f"\n完了: {output_path}", lf)
         except KeyboardInterrupt:

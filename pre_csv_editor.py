@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
@@ -76,7 +77,15 @@ def infer_pre_video_path(csv_path: Path) -> Path:
 
 
 def is_on(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "on", "yes", "y"}
+    return (value or "").strip().lower() in {"1", "true", "t", "on", "yes", "y"}
+
+
+def true_false(value: str | None) -> str:
+    return "T" if is_on(value) else "F"
+
+
+def enabled_mosaic_count(row: dict[str, str]) -> int:
+    return sum(is_on(row.get(f"mosaic{slot}_on")) for slot in range(1, MAX_MOSAICS + 1))
 
 
 def set_blank_crotch(row: dict[str, str], slot: int) -> None:
@@ -102,6 +111,7 @@ def set_rect(row: dict[str, str], slot: int, rect: QRect, on: bool = True) -> No
     row[f"mosaic{slot}_on"] = "1" if on else "0"
     if not row.get(f"mosaic{slot}_type"):
         row[f"mosaic{slot}_type"] = "manual"
+    row[f"mosaic{slot}_score"] = ""
     row[f"mosaic{slot}_x1"] = str(rect.left())
     row[f"mosaic{slot}_y1"] = str(rect.top())
     row[f"mosaic{slot}_x2"] = str(rect.right() + 1)
@@ -116,6 +126,32 @@ def clamp_rect(rect: QRect, width: int, height: int) -> QRect:
     right = max(left + 1, min(width, rect.right() + 1))
     bottom = max(top + 1, min(height, rect.bottom() + 1))
     return QRect(left, top, right - left, bottom - top)
+
+
+def apply_preview_effect(
+    frame: np.ndarray,
+    rect: QRect,
+    intensity: int,
+    effect: str,
+) -> None:
+    x1, y1 = rect.left(), rect.top()
+    x2, y2 = rect.right() + 1, rect.bottom() + 1
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return
+    h, w = roi.shape[:2]
+    if effect == "blur":
+        kernel_size = intensity if intensity % 2 == 1 else intensity + 1
+        frame[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
+        return
+    small = cv2.resize(
+        roi,
+        (max(1, w // intensity), max(1, h // intensity)),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    frame[y1:y2, x1:x2] = cv2.resize(
+        small, (w, h), interpolation=cv2.INTER_NEAREST
+    )
 
 
 class FrameCanvas(QWidget):
@@ -189,6 +225,7 @@ class FrameCanvas(QWidget):
             else:
                 pen = QPen(QColor(180, 180, 180), 2, Qt.PenStyle.DashLine)
             painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(wrect)
             painter.drawText(wrect.topLeft() + QPointF(4, -4), f"mosaic{slot}")
             if slot == selected:
@@ -229,6 +266,19 @@ class FrameCanvas(QWidget):
         return None
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            row = self.parent_window.current_row()
+            slot = self.parent_window.selected_slot
+            img_pos = self.widget_to_image(event.pos())
+            self.drag_mode = "create"
+            self.drag_start_img = img_pos
+            self.drag_start_rect = QRect(img_pos, img_pos)
+            set_rect(row, slot, QRect(img_pos, img_pos), on=True)
+            self.parent_window.mark_dirty()
+            self.parent_window.refresh_mosaic_table()
+            self.update()
+            return
+
         if event.button() != Qt.MouseButton.LeftButton:
             return
         row = self.parent_window.current_row()
@@ -247,23 +297,6 @@ class FrameCanvas(QWidget):
                 self.drag_start_img = img_pos
                 self.drag_start_rect = QRect(rect)
                 return
-
-        slot = self.parent_window.selected_slot
-        rect = get_rect(row, slot)
-        if rect:
-            mode = self.hit_mode(event.pos(), rect)
-            if mode:
-                self.drag_mode = mode
-                self.drag_start_img = img_pos
-                self.drag_start_rect = QRect(rect)
-                return
-        self.drag_mode = "create"
-        self.drag_start_img = img_pos
-        self.drag_start_rect = QRect(img_pos, img_pos)
-        set_rect(row, slot, QRect(img_pos, img_pos), on=True)
-        self.parent_window.mark_dirty()
-        self.parent_window.refresh_mosaic_table()
-        self.update()
 
     def mouseMoveEvent(self, event) -> None:
         if not self.drag_mode:
@@ -303,6 +336,7 @@ class EditorWindow(QMainWindow):
         super().__init__()
         self.csv_path = csv_path
         self.data = read_pre_csv(csv_path)
+        self.original_rows = [dict(row) for row in self.data.rows]
         self.video_path = infer_pre_video_path(csv_path)
         if not self.video_path.is_file():
             raise RuntimeError(f"_pre.mp4 が見つかりません: {self.video_path}")
@@ -314,6 +348,7 @@ class EditorWindow(QMainWindow):
         self.dirty = False
         self.image_width = 0
         self.image_height = 0
+        self.source_frame: np.ndarray | None = None
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
         self.resize(1500, 900)
@@ -325,6 +360,42 @@ class EditorWindow(QMainWindow):
         save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.save_with_confirm)
         self.addAction(save_action)
+
+        prev_frame_action = QAction("前のフレーム", self)
+        prev_frame_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
+        prev_frame_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        prev_frame_action.triggered.connect(self.prev_frame)
+        self.addAction(prev_frame_action)
+
+        next_frame_action = QAction("次のフレーム", self)
+        next_frame_action.setShortcut(QKeySequence(Qt.Key.Key_Right))
+        next_frame_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        next_frame_action.triggered.connect(self.next_frame)
+        self.addAction(next_frame_action)
+
+        prev_row_action = QAction("前のCSV行", self)
+        prev_row_action.setShortcut(QKeySequence(Qt.Key.Key_Up))
+        prev_row_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        prev_row_action.triggered.connect(self.prev_frame)
+        self.addAction(prev_row_action)
+
+        next_row_action = QAction("次のCSV行", self)
+        next_row_action.setShortcut(QKeySequence(Qt.Key.Key_Down))
+        next_row_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        next_row_action.triggered.connect(self.next_frame)
+        self.addAction(next_row_action)
+
+        prev_page_action = QAction("前のCSV行 (PgUp)", self)
+        prev_page_action.setShortcut(QKeySequence(Qt.Key.Key_PageUp))
+        prev_page_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        prev_page_action.triggered.connect(self.prev_frame)
+        self.addAction(prev_page_action)
+
+        next_page_action = QAction("次のCSV行 (PgDn)", self)
+        next_page_action.setShortcut(QKeySequence(Qt.Key.Key_PageDown))
+        next_page_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        next_page_action.triggered.connect(self.next_frame)
+        self.addAction(next_page_action)
 
         splitter = QSplitter()
         self.setCentralWidget(splitter)
@@ -353,8 +424,10 @@ class EditorWindow(QMainWindow):
         self.info_label.setWordWrap(True)
         right_layout.addWidget(self.info_label)
 
-        self.frame_table = QTableWidget(len(self.data.rows), 3)
-        self.frame_table.setHorizontalHeaderLabels(["行", "frame_no", "checked"])
+        self.frame_table = QTableWidget(len(self.data.rows), 4)
+        self.frame_table.setHorizontalHeaderLabels(
+            ["frame_no", "モザイク", "クロッチ", "comment"]
+        )
         self.frame_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.frame_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(QLabel("CSV行"))
@@ -362,21 +435,27 @@ class EditorWindow(QMainWindow):
 
         self.frame_label = QLabel()
         self.on_checkbox = QCheckBox("選択mosaic ON")
+        self.preview_checkbox = QCheckBox("mosaicプレビュー")
         self.type_input = QLineEdit()
         self.type_input.setPlaceholderText("mosaic type")
         self.create_from_nearest_button = QPushButton("直近枠から作成")
         self.delete_button = QPushButton("選択をOFF")
         self.save_button = QPushButton("保存")
+        self.restore_frame_button = QPushButton("現在フレームを元に戻す")
         right_layout.addWidget(self.frame_label)
-        right_layout.addWidget(self.on_checkbox)
+        checkbox_layout = QHBoxLayout()
+        checkbox_layout.addWidget(self.on_checkbox)
+        checkbox_layout.addWidget(self.preview_checkbox)
+        right_layout.addLayout(checkbox_layout)
         right_layout.addWidget(QLabel("Type"))
         right_layout.addWidget(self.type_input)
         right_layout.addWidget(self.create_from_nearest_button)
         right_layout.addWidget(self.delete_button)
         right_layout.addWidget(self.save_button)
+        right_layout.addWidget(self.restore_frame_button)
 
         self.mosaic_table = QTableWidget(DEFAULT_VISIBLE_MOSAICS, 7)
-        self.mosaic_table.setHorizontalHeaderLabels(["No", "ON", "type", "x1", "y1", "x2", "y2"])
+        self.mosaic_table.setHorizontalHeaderLabels(["ON", "type", "score", "x1", "y1", "x2", "y2"])
         self.mosaic_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.mosaic_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(self.mosaic_table, stretch=1)
@@ -387,9 +466,11 @@ class EditorWindow(QMainWindow):
         self.next_button.clicked.connect(self.next_frame)
         self.go_button.clicked.connect(self.go_to_frame)
         self.save_button.clicked.connect(self.save_with_confirm)
+        self.restore_frame_button.clicked.connect(self.restore_current_frame)
         self.delete_button.clicked.connect(self.disable_selected)
         self.create_from_nearest_button.clicked.connect(self.create_from_nearest)
         self.on_checkbox.stateChanged.connect(self.toggle_selected)
+        self.preview_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.type_input.editingFinished.connect(self.update_selected_type)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
@@ -411,12 +492,11 @@ class EditorWindow(QMainWindow):
         if not ok:
             QMessageBox.warning(self, "Error", f"フレームを読めません: index={self.current_index}")
             return
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
+        self.source_frame = frame
+        h, w = frame.shape[:2]
         self.image_width = w
         self.image_height = h
-        qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
-        self.canvas.set_frame(QPixmap.fromImage(qimg), (w, h))
+        self.refresh_canvas_frame()
         frame_no = self.current_row().get("frame_no", "")
         self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}  frame_no={frame_no}")
         self.frame_input.setText(frame_no)
@@ -425,16 +505,54 @@ class EditorWindow(QMainWindow):
         self.select_current_frame_row()
         self.refresh_mosaic_table()
 
+    def refresh_canvas_frame(self, *args) -> None:
+        if self.source_frame is None:
+            return
+        frame = self.source_frame.copy()
+        if self.preview_checkbox.isChecked():
+            meta = self.data.meta_dict
+            try:
+                intensity = max(1, int(meta.get("intensity", "15")))
+            except ValueError:
+                intensity = 15
+            effect = meta.get("effect", "mosaic")
+            for slot in range(1, MAX_MOSAICS + 1):
+                if not is_on(self.current_row().get(f"mosaic{slot}_on")):
+                    continue
+                rect = get_rect(self.current_row(), slot)
+                if rect is not None:
+                    apply_preview_effect(frame, rect, intensity, effect)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
+        self.canvas.set_frame(QPixmap.fromImage(qimg), (w, h))
+
     def populate_frame_table(self) -> None:
         self.frame_table.blockSignals(True)
         for idx, row in enumerate(self.data.rows):
-            values = [str(idx + 1), row.get("frame_no", ""), row.get("checked", "")]
+            self.update_frame_table_row(idx, row)
+        self.frame_table.blockSignals(False)
+
+    def update_frame_table_row(self, idx: int, row: dict[str, str]) -> None:
+        mosaic_count = enabled_mosaic_count(row)
+        nsfw_detection_count = row.get("nsfw_detection_count") or "?"
+        values = [
+            row.get("frame_no", ""),
+            f"{mosaic_count}/{nsfw_detection_count}",
+            "あり" if is_on(row.get("crotch_detected")) else "なし",
+            row.get("comment", ""),
+        ]
+        background = QColor(255, 220, 230) if mosaic_count else QColor(232, 232, 232)
+        self.frame_table.blockSignals(True)
+        try:
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col in (0, 1):
+                item.setBackground(background)
+                if col != 3:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.frame_table.setItem(idx, col, item)
-        self.frame_table.blockSignals(False)
+        finally:
+            self.frame_table.blockSignals(False)
 
     def select_current_frame_row(self) -> None:
         self.frame_table.blockSignals(True)
@@ -448,10 +566,11 @@ class EditorWindow(QMainWindow):
         self.mosaic_table.blockSignals(True)
         self.mosaic_table.setRowCount(len(visible_slots))
         for table_row, slot in enumerate(visible_slots):
+            self.mosaic_table.setVerticalHeaderItem(table_row, QTableWidgetItem(str(slot)))
             values = [
-                str(slot),
-                "1" if is_on(row.get(f"mosaic{slot}_on")) else "0",
+                true_false(row.get(f"mosaic{slot}_on")),
                 row.get(f"mosaic{slot}_type", ""),
+                row.get(f"mosaic{slot}_score", ""),
                 row.get(f"mosaic{slot}_x1", ""),
                 row.get(f"mosaic{slot}_y1", ""),
                 row.get(f"mosaic{slot}_x2", ""),
@@ -459,7 +578,7 @@ class EditorWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col == 0:
+                if col == 2:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if slot == self.selected_slot:
                     item.setBackground(QColor(255, 245, 200))
@@ -472,6 +591,8 @@ class EditorWindow(QMainWindow):
         self.on_checkbox.setChecked(is_on(row.get(f"mosaic{self.selected_slot}_on")))
         self.on_checkbox.blockSignals(False)
         self.type_input.setText(row.get(f"mosaic{self.selected_slot}_type", ""))
+        self.update_frame_table_row(self.current_index, row)
+        self.refresh_canvas_frame()
         self.canvas.update()
 
     def visible_mosaic_slots(self, row: dict[str, str]) -> list[int]:
@@ -484,19 +605,17 @@ class EditorWindow(QMainWindow):
         return visible
 
     def update_mosaic_from_table(self, item: QTableWidgetItem) -> None:
-        no_item = self.mosaic_table.item(item.row(), 0)
-        if no_item is None:
+        header_item = self.mosaic_table.verticalHeaderItem(item.row())
+        if header_item is None:
             return
         try:
-            slot = int(no_item.text())
+            slot = int(header_item.text())
         except ValueError:
             return
         col = item.column()
-        if col == 0:
-            return
         keys = {
-            1: f"mosaic{slot}_on",
-            2: f"mosaic{slot}_type",
+            0: f"mosaic{slot}_on",
+            1: f"mosaic{slot}_type",
             3: f"mosaic{slot}_x1",
             4: f"mosaic{slot}_y1",
             5: f"mosaic{slot}_x2",
@@ -505,17 +624,19 @@ class EditorWindow(QMainWindow):
         key = keys.get(col)
         if not key:
             return
-        self.current_row()[key] = item.text().strip()
+        value = true_false(item.text()) if col == 0 else item.text().strip()
+        self.current_row()[key] = value
         if col >= 3:
+            self.current_row()[f"mosaic{slot}_score"] = ""
             set_blank_crotch(self.current_row(), slot)
         self.mark_dirty()
         self.selected_slot = slot
         self.refresh_mosaic_table()
 
     def update_frame_from_table(self, item: QTableWidgetItem) -> None:
-        if item.column() != 2:
+        if item.column() != 3:
             return
-        self.data.rows[item.row()]["checked"] = item.text().strip()
+        self.data.rows[item.row()]["comment"] = item.text().strip()
         self.mark_dirty()
 
     def select_frame_row(self, row: int, col: int) -> None:
@@ -524,11 +645,11 @@ class EditorWindow(QMainWindow):
             self.load_frame()
 
     def select_mosaic(self, row: int, col: int) -> None:
-        no_item = self.mosaic_table.item(row, 0)
-        if no_item is None:
+        header_item = self.mosaic_table.verticalHeaderItem(row)
+        if header_item is None:
             return
         try:
-            self.selected_slot = int(no_item.text())
+            self.selected_slot = int(header_item.text())
         except ValueError:
             return
         selected_rect = get_rect(self.current_row(), self.selected_slot)
@@ -551,6 +672,11 @@ class EditorWindow(QMainWindow):
     def disable_selected(self, *args) -> None:
         self.current_row()[f"mosaic{self.selected_slot}_on"] = "0"
         set_blank_crotch(self.current_row(), self.selected_slot)
+        self.mark_dirty()
+        self.refresh_mosaic_table()
+
+    def restore_current_frame(self, *args) -> None:
+        self.data.rows[self.current_index] = dict(self.original_rows[self.current_index])
         self.mark_dirty()
         self.refresh_mosaic_table()
 
@@ -621,11 +747,7 @@ class EditorWindow(QMainWindow):
         QMessageBox.information(self, "Not found", f"frame_no={wanted} はCSVにありません")
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Left:
-            self.prev_frame()
-        elif event.key() == Qt.Key.Key_Right:
-            self.next_frame()
-        elif event.key() == Qt.Key.Key_Delete:
+        if event.key() == Qt.Key.Key_Delete:
             self.disable_selected()
         else:
             super().keyPressEvent(event)
