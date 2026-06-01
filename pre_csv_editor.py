@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import sys
 from dataclasses import dataclass
@@ -26,8 +27,12 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSlider,
     QSplitter,
     QSpinBox,
+    QStyle,
+    QStyleOptionSlider,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -37,6 +42,10 @@ from PyQt6.QtWidgets import (
 MAX_MOSAICS = 255
 DEFAULT_VISIBLE_MOSAICS = 5
 HANDLE_SIZE = 8
+DEFAULT_INTENSITY_SLIDER_MAX = 100
+MIN_ZOOM = 0.25
+MAX_ZOOM = 8.0
+ZOOM_STEP = 1.15
 
 
 @dataclass
@@ -169,6 +178,103 @@ def apply_preview_effect(
     )
 
 
+class SequenceSlider(QSlider):
+    def __init__(self, frame_numbers: list[int]) -> None:
+        super().__init__(Qt.Orientation.Horizontal)
+        self.frame_numbers = frame_numbers
+        self.setMinimumHeight(42)
+        self.setStyleSheet(
+            """
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #a0a0a0;
+            }
+            QSlider::handle:horizontal {
+                width: 5px;
+                margin: -8px 0;
+                background: #0068c9;
+                border: 1px solid #004b91;
+            }
+            """
+        )
+
+    def tick_index(self, frame_no: int) -> int:
+        index = bisect.bisect_left(self.frame_numbers, frame_no)
+        if index >= len(self.frame_numbers):
+            return len(self.frame_numbers) - 1
+        if index > 0 and frame_no - self.frame_numbers[index - 1] < self.frame_numbers[index] - frame_no:
+            return index - 1
+        return index
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self.frame_numbers:
+            return
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        slider_max = max(0, self.width() - handle.width())
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor("#505050")))
+        first_frame = self.frame_numbers[0]
+        last_frame = self.frame_numbers[-1]
+        for frame_no in range(first_frame, last_frame + 1, 100):
+            position = QStyle.sliderPositionFromValue(
+                self.minimum(),
+                self.maximum(),
+                self.tick_index(frame_no),
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+            x = position + handle.width() // 2
+            painter.drawLine(x, 24, x, 29)
+            label_x = max(0, min(self.width() - 80, x - 40))
+            alignment = Qt.AlignmentFlag.AlignHCenter
+            if x < 40:
+                alignment = Qt.AlignmentFlag.AlignLeft
+            elif x > self.width() - 40:
+                alignment = Qt.AlignmentFlag.AlignRight
+            painter.drawText(label_x, 29, 80, 13, alignment, str(frame_no))
+
+    def mousePressEvent(self, event) -> None:
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        if event.button() == Qt.MouseButton.LeftButton and not handle.contains(event.position().toPoint()):
+            slider_max = max(0, self.width() - handle.width())
+            position = round(event.position().x() - handle.width() / 2)
+            self.setValue(
+                QStyle.sliderValueFromPosition(
+                    self.minimum(),
+                    self.maximum(),
+                    position,
+                    slider_max,
+                    upsideDown=option.upsideDown,
+                )
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class CanvasScrollArea(QScrollArea):
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        canvas = self.widget()
+        if canvas is not None and hasattr(canvas, "update_canvas_size"):
+            canvas.update_canvas_size()
+
+
 class FrameCanvas(QWidget):
     def __init__(self, parent: "EditorWindow") -> None:
         super().__init__()
@@ -178,22 +284,52 @@ class FrameCanvas(QWidget):
         self.drag_mode: str | None = None
         self.drag_start_img = QPoint()
         self.drag_start_rect = QRect()
-        self.setMinimumSize(640, 360)
+        self.pan_start_pos = QPoint()
+        self.pan_start_scroll = QPoint()
+        self.zoom_factor = 1.0
+        self.scroll_area: QScrollArea | None = None
+        self.resize(640, 360)
         self.setMouseTracking(True)
+
+    def set_scroll_area(self, scroll_area: QScrollArea) -> None:
+        self.scroll_area = scroll_area
+        self.update_canvas_size()
 
     def set_frame(self, pixmap: QPixmap, image_size) -> None:
         self.pixmap = pixmap
         self.image_size = image_size
+        self.update_canvas_size()
+        self.update()
+
+    def viewport_size(self):
+        if self.scroll_area is not None:
+            return self.scroll_area.viewport().size()
+        return self.size()
+
+    def update_canvas_size(self) -> None:
+        if self.scroll_area is None:
+            return
+        viewport = self.viewport_size()
+        width = viewport.width()
+        height = viewport.height()
+        if self.pixmap:
+            scaled = self.pixmap.size()
+            scaled.scale(viewport, Qt.AspectRatioMode.KeepAspectRatio)
+            width = max(width, round(scaled.width() * self.zoom_factor))
+            height = max(height, round(scaled.height() * self.zoom_factor))
+        self.resize(width, height)
         self.update()
 
     def image_rect_on_widget(self) -> QRectF:
         if not self.pixmap:
             return QRectF()
         scaled = self.pixmap.size()
-        scaled.scale(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-        x = (self.width() - scaled.width()) / 2
-        y = (self.height() - scaled.height()) / 2
-        return QRectF(x, y, scaled.width(), scaled.height())
+        scaled.scale(self.viewport_size(), Qt.AspectRatioMode.KeepAspectRatio)
+        width = scaled.width() * self.zoom_factor
+        height = scaled.height() * self.zoom_factor
+        x = (self.width() - width) / 2
+        y = (self.height() - height) / 2
+        return QRectF(x, y, width, height)
 
     def widget_to_image(self, pos: QPoint) -> QPoint:
         image_rect = self.image_rect_on_widget()
@@ -281,6 +417,20 @@ class FrameCanvas(QWidget):
         return None
 
     def mousePressEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and self.scroll_area is not None
+        ):
+            self.drag_mode = "pan"
+            self.pan_start_pos = event.globalPosition().toPoint()
+            self.pan_start_scroll = QPoint(
+                self.scroll_area.horizontalScrollBar().value(),
+                self.scroll_area.verticalScrollBar().value(),
+            )
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.RightButton:
             row = self.parent_window.current_row()
             slot = self.parent_window.selected_slot
@@ -316,6 +466,12 @@ class FrameCanvas(QWidget):
     def mouseMoveEvent(self, event) -> None:
         if not self.drag_mode:
             return
+        if self.drag_mode == "pan":
+            delta = event.globalPosition().toPoint() - self.pan_start_pos
+            self.scroll_area.horizontalScrollBar().setValue(self.pan_start_scroll.x() - delta.x())
+            self.scroll_area.verticalScrollBar().setValue(self.pan_start_scroll.y() - delta.y())
+            event.accept()
+            return
         row = self.parent_window.current_row()
         slot = self.parent_window.selected_slot
         pos = self.widget_to_image(event.pos())
@@ -343,7 +499,29 @@ class FrameCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event) -> None:
+        if self.drag_mode == "pan":
+            self.unsetCursor()
         self.drag_mode = None
+
+    def wheelEvent(self, event) -> None:
+        if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            super().wheelEvent(event)
+            return
+        if event.angleDelta().y() > 0:
+            self.zoom_factor = min(MAX_ZOOM, self.zoom_factor * ZOOM_STEP)
+        elif event.angleDelta().y() < 0:
+            self.zoom_factor = max(MIN_ZOOM, self.zoom_factor / ZOOM_STEP)
+        horizontal_bar = self.scroll_area.horizontalScrollBar() if self.scroll_area else None
+        vertical_bar = self.scroll_area.verticalScrollBar() if self.scroll_area else None
+        horizontal_ratio = horizontal_bar.value() / horizontal_bar.maximum() if horizontal_bar and horizontal_bar.maximum() else 0.5
+        vertical_ratio = vertical_bar.value() / vertical_bar.maximum() if vertical_bar and vertical_bar.maximum() else 0.5
+        self.update_canvas_size()
+        if horizontal_bar is not None:
+            horizontal_bar.setValue(round(horizontal_bar.maximum() * horizontal_ratio))
+        if vertical_bar is not None:
+            vertical_bar.setValue(round(vertical_bar.maximum() * vertical_ratio))
+        self.parent_window.update_zoom_label(self.zoom_factor)
+        event.accept()
 
 
 class EditorWindow(QMainWindow):
@@ -423,8 +601,29 @@ class EditorWindow(QMainWindow):
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
+        self.info_label = QLabel(f"CSV: {self.csv_path}\nVideo: {self.video_path}")
+        self.info_label.setWordWrap(True)
+        left_layout.addWidget(self.info_label)
         self.canvas = FrameCanvas(self)
-        left_layout.addWidget(self.canvas, stretch=1)
+        self.canvas_scroll_area = CanvasScrollArea()
+        self.canvas_scroll_area.setWidgetResizable(False)
+        self.canvas_scroll_area.setWidget(self.canvas)
+        self.canvas.set_scroll_area(self.canvas_scroll_area)
+        left_layout.addWidget(self.canvas_scroll_area, stretch=1)
+        self.frame_label = QLabel()
+        self.zoom_label = QLabel("100%")
+        self.preview_checkbox = QCheckBox("mosaicプレビュー")
+        self.preview_checkbox.setChecked(True)
+        frame_status_layout = QHBoxLayout()
+        frame_status_layout.addWidget(self.frame_label)
+        frame_status_layout.addWidget(self.zoom_label)
+        frame_status_layout.addWidget(self.preview_checkbox)
+        frame_status_layout.addStretch()
+        left_layout.addLayout(frame_status_layout)
+        frame_numbers = [int(row["frame_no"]) for row in self.data.rows]
+        self.sequence_slider = SequenceSlider(frame_numbers)
+        self.sequence_slider.setRange(0, max(0, len(self.data.rows) - 1))
+        left_layout.addWidget(self.sequence_slider)
 
         nav = QHBoxLayout()
         self.prev_button = QPushButton("前へ")
@@ -436,14 +635,10 @@ class EditorWindow(QMainWindow):
             nav.addWidget(button)
         nav.addWidget(QLabel("Frame:"))
         nav.addWidget(self.frame_input)
-        left_layout.addLayout(nav)
         splitter.addWidget(left)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        self.info_label = QLabel(f"CSV: {self.csv_path}\nVideo: {self.video_path}")
-        self.info_label.setWordWrap(True)
-        right_layout.addWidget(self.info_label)
 
         meta = self.data.meta_dict
         meta_layout = QFormLayout()
@@ -452,12 +647,20 @@ class EditorWindow(QMainWindow):
         self.effect_combo.setCurrentText(meta.get("effect", "mosaic"))
         self.intensity_spin = QSpinBox()
         self.intensity_spin.setRange(1, 2147483647)
+        self.intensity_spin.setFixedWidth(70)
         try:
             intensity = int(meta.get("intensity", "15"))
         except ValueError:
             intensity = 15
         self.intensity_spin.setValue(max(1, intensity))
-        meta_layout.addRow("intensity", self.intensity_spin)
+        self.intensity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.intensity_slider.setRange(1, max(DEFAULT_INTENSITY_SLIDER_MAX, intensity))
+        self.intensity_slider.setValue(max(1, intensity))
+        intensity_layout = QHBoxLayout()
+        intensity_layout.setContentsMargins(0, 0, 0, 0)
+        intensity_layout.addWidget(self.intensity_spin)
+        intensity_layout.addWidget(self.intensity_slider, stretch=1)
+        meta_layout.addRow("intensity", intensity_layout)
         meta_layout.addRow("effect", self.effect_combo)
         for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch"):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
@@ -472,24 +675,14 @@ class EditorWindow(QMainWindow):
         right_layout.addWidget(QLabel("CSV行"))
         right_layout.addWidget(self.frame_table, stretch=1)
 
-        self.frame_label = QLabel()
-        self.on_checkbox = QCheckBox("選択mosaic ON")
-        self.preview_checkbox = QCheckBox("mosaicプレビュー")
         self.type_input = QLineEdit()
         self.type_input.setPlaceholderText("mosaic type")
         self.create_from_nearest_button = QPushButton("直近枠から作成")
-        self.delete_button = QPushButton("選択をOFF")
         self.save_button = QPushButton("保存")
         self.restore_frame_button = QPushButton("現在フレームを元に戻す")
-        right_layout.addWidget(self.frame_label)
-        checkbox_layout = QHBoxLayout()
-        checkbox_layout.addWidget(self.on_checkbox)
-        checkbox_layout.addWidget(self.preview_checkbox)
-        right_layout.addLayout(checkbox_layout)
         right_layout.addWidget(QLabel("Type"))
         right_layout.addWidget(self.type_input)
         right_layout.addWidget(self.create_from_nearest_button)
-        right_layout.addWidget(self.delete_button)
         right_layout.addWidget(self.save_button)
         right_layout.addWidget(self.restore_frame_button)
 
@@ -498,19 +691,21 @@ class EditorWindow(QMainWindow):
         self.mosaic_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.mosaic_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(self.mosaic_table, stretch=1)
+        right_layout.addLayout(nav)
         splitter.addWidget(right)
         splitter.setSizes([1100, 400])
 
         self.prev_button.clicked.connect(self.prev_frame)
         self.next_button.clicked.connect(self.next_frame)
         self.go_button.clicked.connect(self.go_to_frame)
+        self.sequence_slider.valueChanged.connect(self.select_sequence_frame)
         self.save_button.clicked.connect(self.save_with_confirm)
         self.restore_frame_button.clicked.connect(self.restore_current_frame)
-        self.delete_button.clicked.connect(self.disable_selected)
         self.create_from_nearest_button.clicked.connect(self.create_from_nearest)
-        self.on_checkbox.stateChanged.connect(self.toggle_selected)
         self.preview_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.effect_combo.currentTextChanged.connect(self.update_preview_meta)
+        self.intensity_slider.valueChanged.connect(self.intensity_spin.setValue)
+        self.intensity_spin.valueChanged.connect(self.sync_intensity_slider)
         self.intensity_spin.valueChanged.connect(self.update_preview_meta)
         self.type_input.editingFinished.connect(self.update_selected_type)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
@@ -521,6 +716,9 @@ class EditorWindow(QMainWindow):
 
     def current_row(self) -> dict[str, str]:
         return self.data.rows[self.current_index]
+
+    def update_zoom_label(self, zoom_factor: float) -> None:
+        self.zoom_label.setText(f"{round(zoom_factor * 100)}%")
 
     def mark_dirty(self) -> None:
         self.dirty = True
@@ -544,8 +742,11 @@ class EditorWindow(QMainWindow):
         self.image_width = w
         self.image_height = h
         self.refresh_canvas_frame()
-        self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}  frame_no={frame_no}")
+        self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}")
         self.frame_input.setText(str(frame_no))
+        self.sequence_slider.blockSignals(True)
+        self.sequence_slider.setValue(self.current_index)
+        self.sequence_slider.blockSignals(False)
         if get_rect(self.current_row(), self.selected_slot) is None:
             self.populate_selected_from_nearest(on=False)
         self.select_current_frame_row()
@@ -578,6 +779,11 @@ class EditorWindow(QMainWindow):
         set_meta_value(self.data, "intensity", str(self.intensity_spin.value()))
         self.mark_dirty()
         self.refresh_canvas_frame()
+
+    def sync_intensity_slider(self, intensity: int) -> None:
+        if intensity > self.intensity_slider.maximum():
+            self.intensity_slider.setMaximum(intensity)
+        self.intensity_slider.setValue(intensity)
 
     def populate_frame_table(self) -> None:
         self.frame_table.blockSignals(True)
@@ -630,7 +836,7 @@ class EditorWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col == 2:
+                if col in (0, 2):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if slot == self.selected_slot:
                     item.setBackground(QColor(255, 245, 200))
@@ -639,9 +845,6 @@ class EditorWindow(QMainWindow):
         selected_row = visible_slots.index(self.selected_slot) if self.selected_slot in visible_slots else 0
         self.mosaic_table.selectRow(selected_row)
         self.mosaic_table.scrollToItem(self.mosaic_table.item(selected_row, 0))
-        self.on_checkbox.blockSignals(True)
-        self.on_checkbox.setChecked(is_on(row.get(f"mosaic{self.selected_slot}_on")))
-        self.on_checkbox.blockSignals(False)
         self.type_input.setText(row.get(f"mosaic{self.selected_slot}_type", ""))
         self.update_frame_table_row(self.current_index, row)
         self.refresh_canvas_frame()
@@ -696,6 +899,11 @@ class EditorWindow(QMainWindow):
             self.current_index = row
             self.load_frame()
 
+    def select_sequence_frame(self, index: int) -> None:
+        if 0 <= index < len(self.data.rows) and index != self.current_index:
+            self.current_index = index
+            self.load_frame()
+
     def select_mosaic(self, row: int, col: int) -> None:
         header_item = self.mosaic_table.verticalHeaderItem(row)
         if header_item is None:
@@ -704,16 +912,18 @@ class EditorWindow(QMainWindow):
             self.selected_slot = int(header_item.text())
         except ValueError:
             return
+        if col == 0:
+            key = f"mosaic{self.selected_slot}_on"
+            on = not is_on(self.current_row().get(key))
+            self.current_row()[key] = "1" if on else "0"
+            if on and get_rect(self.current_row(), self.selected_slot) is None:
+                self.populate_selected_from_nearest(on=True)
+            self.mark_dirty()
+            self.refresh_mosaic_table()
+            return
         selected_rect = get_rect(self.current_row(), self.selected_slot)
         if selected_rect is None:
             self.populate_selected_from_nearest(on=False)
-        self.refresh_mosaic_table()
-
-    def toggle_selected(self, *args) -> None:
-        self.current_row()[f"mosaic{self.selected_slot}_on"] = "1" if self.on_checkbox.isChecked() else "0"
-        if self.on_checkbox.isChecked() and get_rect(self.current_row(), self.selected_slot) is None:
-            self.populate_selected_from_nearest(on=True)
-        self.mark_dirty()
         self.refresh_mosaic_table()
 
     def update_selected_type(self, *args) -> None:
