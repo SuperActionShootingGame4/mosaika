@@ -114,6 +114,7 @@ CSV エディタでは、`←` キーで1つ前のフレーム、`→` キーで
 画像上の既存枠は左ドラッグで移動・リサイズする。新規作成または選択中枠の作り直しは、画像上を右ドラッグして範囲を指定する。枠外の左クリックでは新しい枠を作成しない。
 `mosaicプレビュー` を ON にすると、有効な枠へ CSV の `effect` と `intensity` で指定されたエフェクトを適用して表示する。
 CSV エディタの表示画像は、pre 動画ではなく CSV の `source_video` に記録された元動画から読み込む。
+Linux 向け単一実行ファイルは `./build_linux_editor.sh` で `dist/mosaika-pre-csv-editor` に生成する。配布先では `./mosaika-pre-csv-editor input_pre.csv` で起動する。CSV の `source_video` に記録されたパスが見つからない場合は、CSV と同じフォルダにある同名動画を読み込む。
 モザイク詳細マトリクスで枠を選択し、`Del` キーを押すと選択中の枠を OFF にできる。
 CSV行マトリクスの上には `intensity`、`effect`、`confidence`、`pose_model`、`yolo_nsfw_model`、`interpolate_gap`、`no_crotch` を表示する。`effect` と `intensity` は編集でき、`mosaicプレビュー` が ON の場合は表示へ即時反映する。
 

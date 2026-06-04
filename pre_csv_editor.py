@@ -93,11 +93,19 @@ def set_meta_value(data: CsvData, key: str, value: str) -> None:
     data.meta.append([key, value])
 
 
-def source_video_path(data: CsvData) -> Path:
+def source_video_path(data: CsvData, csv_path: Path) -> Path:
     source_video = data.meta_dict.get("source_video", "").strip()
     if not source_video:
         raise RuntimeError("CSVに source_video がありません")
-    return Path(source_video)
+    video_path = Path(source_video).expanduser()
+    candidates = [video_path]
+    if not video_path.is_absolute():
+        candidates.insert(0, csv_path.parent / video_path)
+    candidates.append(csv_path.parent / video_path.name)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return video_path
 
 
 def is_on(value: str | None) -> bool:
@@ -530,7 +538,7 @@ class EditorWindow(QMainWindow):
         self.csv_path = csv_path
         self.data = read_pre_csv(csv_path)
         self.original_rows = [dict(row) for row in self.data.rows]
-        self.video_path = source_video_path(self.data)
+        self.video_path = source_video_path(self.data, self.csv_path)
         if not self.video_path.is_file():
             raise RuntimeError(f"元動画が見つかりません: {self.video_path}")
         self.cap = cv2.VideoCapture(str(self.video_path))
