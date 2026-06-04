@@ -160,6 +160,122 @@ def clamp_rect(rect: QRect, width: int, height: int) -> QRect:
     return QRect(left, top, right - left, bottom - top)
 
 
+def rect_to_xywh(rect: QRect) -> tuple[int, int, int, int]:
+    return rect.left(), rect.top(), rect.width(), rect.height()
+
+
+def xywh_to_rect(x: int, y: int, width: int, height: int) -> QRect:
+    return QRect(x, y, max(1, width), max(1, height))
+
+
+def track_rect_template(
+    prev_frame: np.ndarray,
+    next_frame: np.ndarray,
+    rect: QRect,
+    search_scale: float = 2.0,
+) -> tuple[QRect, float] | None:
+    rect = rect.normalized()
+    x, y, w, h = rect_to_xywh(rect)
+    if w < 4 or h < 4:
+        return None
+    prev_h, prev_w = prev_frame.shape[:2]
+    next_h, next_w = next_frame.shape[:2]
+    if x < 0 or y < 0 or x + w > prev_w or y + h > prev_h:
+        return None
+
+    template = cv2.cvtColor(prev_frame[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+    if template.size == 0:
+        return None
+    margin_x = max(12, round(w * search_scale))
+    margin_y = max(12, round(h * search_scale))
+    sx1 = max(0, x - margin_x)
+    sy1 = max(0, y - margin_y)
+    sx2 = min(next_w, x + w + margin_x)
+    sy2 = min(next_h, y + h + margin_y)
+    search = cv2.cvtColor(next_frame[sy1:sy2, sx1:sx2], cv2.COLOR_BGR2GRAY)
+    if search.size == 0:
+        return None
+
+    best: tuple[float, QRect] | None = None
+    for scale in (0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.3):
+        tw = max(4, round(w * scale))
+        th = max(4, round(h * scale))
+        if tw > search.shape[1] or th > search.shape[0]:
+            continue
+        scaled_template = cv2.resize(template, (tw, th), interpolation=cv2.INTER_AREA)
+        result = cv2.matchTemplate(search, scaled_template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(result)
+        if not np.isfinite(score):
+            continue
+        candidate = xywh_to_rect(sx1 + loc[0], sy1 + loc[1], tw, th)
+        if best is None or score > best[0]:
+            best = (float(score), candidate)
+
+    if best is None:
+        return None
+    return best[1], best[0]
+
+
+def refine_rect_with_optical_flow(prev_frame: np.ndarray, next_frame: np.ndarray, rect: QRect) -> QRect | None:
+    rect = rect.normalized()
+    x, y, w, h = rect_to_xywh(rect)
+    prev_h, prev_w = prev_frame.shape[:2]
+    if x < 0 or y < 0 or x + w > prev_w or y + h > prev_h:
+        return None
+
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    next_gray = cv2.cvtColor(next_frame, cv2.COLOR_BGR2GRAY)
+    mask = np.zeros(prev_gray.shape, dtype=np.uint8)
+    mask[y:y + h, x:x + w] = 255
+    points = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners=80,
+        qualityLevel=0.01,
+        minDistance=max(3, min(w, h) // 10),
+        mask=mask,
+    )
+    if points is None or len(points) < 4:
+        return None
+    next_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, next_gray, points, None)
+    if next_points is None or status is None:
+        return None
+    valid = status.reshape(-1) == 1
+    if int(valid.sum()) < 4:
+        return None
+    deltas = next_points[valid].reshape(-1, 2) - points[valid].reshape(-1, 2)
+    dx, dy = np.median(deltas, axis=0)
+    return QRect(round(x + float(dx)), round(y + float(dy)), w, h)
+
+
+def track_rect(prev_frame: np.ndarray, next_frame: np.ndarray, rect: QRect) -> tuple[QRect, float, str] | None:
+    template_result = track_rect_template(prev_frame, next_frame, rect)
+    flow_rect = refine_rect_with_optical_flow(prev_frame, next_frame, rect)
+    if template_result is None and flow_rect is None:
+        return None
+    if template_result is None and flow_rect is not None:
+        return flow_rect, 0.0, "flow"
+    template_rect, score = template_result
+    if flow_rect is None:
+        return template_rect, score, "template"
+
+    dx = abs(template_rect.center().x() - flow_rect.center().x())
+    dy = abs(template_rect.center().y() - flow_rect.center().y())
+    tolerance = max(8, min(rect.width(), rect.height()) // 2)
+    if dx <= tolerance and dy <= tolerance:
+        return template_rect, score, "template+flow"
+    if score >= 0.55:
+        return template_rect, score, "template"
+    return flow_rect, score, "flow"
+
+
+def interpolate_rect(start: QRect, end: QRect, t: float) -> QRect:
+    x = round(start.left() + (end.left() - start.left()) * t)
+    y = round(start.top() + (end.top() - start.top()) * t)
+    width = round(start.width() + (end.width() - start.width()) * t)
+    height = round(start.height() + (end.height() - start.height()) * t)
+    return QRect(x, y, max(1, width), max(1, height))
+
+
 def apply_preview_effect(
     frame: np.ndarray,
     rect: QRect,
@@ -550,6 +666,8 @@ class EditorWindow(QMainWindow):
         self.image_width = 0
         self.image_height = 0
         self.source_frame: np.ndarray | None = None
+        self.trace_slots: set[int] = set()
+        self.auto_track_anchors: dict[int, tuple[int, QRect, np.ndarray, str]] = {}
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
         self.resize(1500, 900)
@@ -674,9 +792,9 @@ class EditorWindow(QMainWindow):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
 
-        self.frame_table = QTableWidget(len(self.data.rows), 4)
+        self.frame_table = QTableWidget(len(self.data.rows), 5)
         self.frame_table.setHorizontalHeaderLabels(
-            ["frame_no", "モザイク", "クロッチ", "comment"]
+            ["frame_no", "modify", "Mosaic", "Crotch", "comment"]
         )
         self.frame_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.frame_table.horizontalHeader().setStretchLastSection(True)
@@ -685,17 +803,20 @@ class EditorWindow(QMainWindow):
 
         self.type_input = QLineEdit()
         self.type_input.setPlaceholderText("mosaic type")
+        self.auto_track_status = QLabel("")
+        self.auto_track_status.setWordWrap(True)
         self.create_from_nearest_button = QPushButton("直近枠から作成")
         self.save_button = QPushButton("保存")
         self.restore_frame_button = QPushButton("現在フレームを元に戻す")
         right_layout.addWidget(QLabel("Type"))
         right_layout.addWidget(self.type_input)
+        right_layout.addWidget(self.auto_track_status)
         right_layout.addWidget(self.create_from_nearest_button)
         right_layout.addWidget(self.save_button)
         right_layout.addWidget(self.restore_frame_button)
 
-        self.mosaic_table = QTableWidget(DEFAULT_VISIBLE_MOSAICS, 7)
-        self.mosaic_table.setHorizontalHeaderLabels(["ON", "type", "score", "x1", "y1", "x2", "y2"])
+        self.mosaic_table = QTableWidget(DEFAULT_VISIBLE_MOSAICS, 8)
+        self.mosaic_table.setHorizontalHeaderLabels(["mosaic", "Trace", "type", "score", "x1", "y1", "x2", "y2"])
         self.mosaic_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.mosaic_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(self.mosaic_table, stretch=1)
@@ -799,13 +920,19 @@ class EditorWindow(QMainWindow):
             self.update_frame_table_row(idx, row)
         self.frame_table.blockSignals(False)
 
+    def row_modified(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self.original_rows):
+            return False
+        return self.data.rows[idx] != self.original_rows[idx]
+
     def update_frame_table_row(self, idx: int, row: dict[str, str]) -> None:
         mosaic_count = enabled_mosaic_count(row)
         nsfw_detection_count = row.get("nsfw_detection_count") or "?"
         values = [
             row.get("frame_no", ""),
+            "T" if self.row_modified(idx) else "F",
             f"{mosaic_count}/{nsfw_detection_count}",
-            "あり" if is_on(row.get("crotch_detected")) else "なし",
+            "あり" if is_on(row.get("crotch_detected")) else "none",
             row.get("comment", ""),
         ]
         background = QColor(255, 220, 230) if mosaic_count else QColor(232, 232, 232)
@@ -814,7 +941,7 @@ class EditorWindow(QMainWindow):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setBackground(background)
-                if col != 3:
+                if col != 4:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.frame_table.setItem(idx, col, item)
         finally:
@@ -835,6 +962,7 @@ class EditorWindow(QMainWindow):
             self.mosaic_table.setVerticalHeaderItem(table_row, QTableWidgetItem(str(slot)))
             values = [
                 true_false(row.get(f"mosaic{slot}_on")),
+                "T" if slot in self.trace_slots else "F",
                 row.get(f"mosaic{slot}_type", ""),
                 row.get(f"mosaic{slot}_score", ""),
                 row.get(f"mosaic{slot}_x1", ""),
@@ -844,7 +972,7 @@ class EditorWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col in (0, 2):
+                if col in (0, 3):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if slot == self.selected_slot:
                     item.setBackground(QColor(255, 245, 200))
@@ -861,7 +989,7 @@ class EditorWindow(QMainWindow):
     def visible_mosaic_slots(self, row: dict[str, str]) -> list[int]:
         visible = list(range(1, DEFAULT_VISIBLE_MOSAICS + 1))
         for slot in range(DEFAULT_VISIBLE_MOSAICS + 1, MAX_MOSAICS + 1):
-            if is_on(row.get(f"mosaic{slot}_on")) or get_rect(row, slot) is not None:
+            if is_on(row.get(f"mosaic{slot}_on")) or get_rect(row, slot) is not None or slot in self.trace_slots:
                 visible.append(slot)
         if self.selected_slot not in visible:
             visible.append(self.selected_slot)
@@ -876,20 +1004,29 @@ class EditorWindow(QMainWindow):
         except ValueError:
             return
         col = item.column()
+        if col == 1:
+            if is_on(item.text()):
+                self.trace_slots.add(slot)
+            else:
+                self.trace_slots.discard(slot)
+                self.auto_track_anchors.pop(slot, None)
+            self.selected_slot = slot
+            self.refresh_mosaic_table()
+            return
         keys = {
             0: f"mosaic{slot}_on",
-            1: f"mosaic{slot}_type",
-            3: f"mosaic{slot}_x1",
-            4: f"mosaic{slot}_y1",
-            5: f"mosaic{slot}_x2",
-            6: f"mosaic{slot}_y2",
+            2: f"mosaic{slot}_type",
+            4: f"mosaic{slot}_x1",
+            5: f"mosaic{slot}_y1",
+            6: f"mosaic{slot}_x2",
+            7: f"mosaic{slot}_y2",
         }
         key = keys.get(col)
         if not key:
             return
         value = true_false(item.text()) if col == 0 else item.text().strip()
         self.current_row()[key] = value
-        if col >= 3:
+        if col >= 4:
             self.current_row()[f"mosaic{slot}_score"] = ""
             set_blank_crotch(self.current_row(), slot)
         self.mark_dirty()
@@ -897,20 +1034,19 @@ class EditorWindow(QMainWindow):
         self.refresh_mosaic_table()
 
     def update_frame_from_table(self, item: QTableWidgetItem) -> None:
-        if item.column() != 3:
+        if item.column() != 4:
             return
         self.data.rows[item.row()]["comment"] = item.text().strip()
         self.mark_dirty()
+        self.update_frame_table_row(item.row(), self.data.rows[item.row()])
 
     def select_frame_row(self, row: int, col: int) -> None:
         if 0 <= row < len(self.data.rows):
-            self.current_index = row
-            self.load_frame()
+            self.move_to_index(row)
 
     def select_sequence_frame(self, index: int) -> None:
         if 0 <= index < len(self.data.rows) and index != self.current_index:
-            self.current_index = index
-            self.load_frame()
+            self.move_to_index(index)
 
     def select_mosaic(self, row: int, col: int) -> None:
         header_item = self.mosaic_table.verticalHeaderItem(row)
@@ -927,6 +1063,14 @@ class EditorWindow(QMainWindow):
             if on and get_rect(self.current_row(), self.selected_slot) is None:
                 self.populate_selected_from_nearest(on=True)
             self.mark_dirty()
+            self.refresh_mosaic_table()
+            return
+        if col == 1:
+            if self.selected_slot in self.trace_slots:
+                self.trace_slots.discard(self.selected_slot)
+                self.auto_track_anchors.pop(self.selected_slot, None)
+            else:
+                self.trace_slots.add(self.selected_slot)
             self.refresh_mosaic_table()
             return
         selected_rect = get_rect(self.current_row(), self.selected_slot)
@@ -999,22 +1143,95 @@ class EditorWindow(QMainWindow):
 
     def prev_frame(self, *args) -> None:
         if self.current_index > 0:
-            self.current_index -= 1
-            self.load_frame()
+            self.move_to_index(self.current_index - 1)
 
     def next_frame(self, *args) -> None:
         if self.current_index < len(self.data.rows) - 1:
-            self.current_index += 1
-            self.load_frame()
+            self.move_to_index(self.current_index + 1)
 
     def go_to_frame(self, *args) -> None:
         wanted = self.frame_input.text().strip()
         for idx, row in enumerate(self.data.rows):
             if row.get("frame_no") == wanted:
-                self.current_index = idx
-                self.load_frame()
+                self.move_to_index(idx)
                 return
         QMessageBox.information(self, "Not found", f"frame_no={wanted} はCSVにありません")
+
+    def move_to_index(self, target_index: int) -> None:
+        if target_index == self.current_index:
+            return
+        if target_index == self.current_index + 1:
+            self.auto_track_next_frame(target_index)
+        self.current_index = target_index
+        self.load_frame()
+
+    def frame_at_index(self, index: int) -> np.ndarray | None:
+        frame_no_text = self.data.rows[index].get("frame_no", "")
+        try:
+            frame_no = int(frame_no_text)
+        except ValueError:
+            return None
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
+    def auto_track_next_frame(self, target_index: int) -> None:
+        if not self.trace_slots:
+            return
+        messages = []
+        for slot in sorted(self.trace_slots):
+            message = self.auto_track_slot_next_frame(target_index, slot)
+            if message:
+                messages.append(message)
+        if messages:
+            self.auto_track_status.setText(" / ".join(messages))
+
+    def auto_track_slot_next_frame(self, target_index: int, slot: int) -> str:
+        row = self.current_row()
+        rect = get_rect(row, slot)
+        prev_frame = self.source_frame if self.source_frame is not None else self.frame_at_index(self.current_index)
+        if rect is not None and is_on(row.get(f"mosaic{slot}_on")) and prev_frame is not None:
+            label = row.get(f"mosaic{slot}_type", "") or "manual"
+            self.auto_track_anchors[slot] = (self.current_index, QRect(rect), prev_frame.copy(), label)
+
+        anchor = self.auto_track_anchors.get(slot)
+        if anchor is None:
+            return f"mosaic{slot}: 枠なし"
+        anchor_index, anchor_rect, anchor_frame, label = anchor
+        gap = target_index - anchor_index - 1
+        if gap < 0:
+            self.auto_track_anchors.pop(slot, None)
+            return f"mosaic{slot}: リセット"
+        if gap > self.max_interpolate_gap():
+            return f"mosaic{slot}: gap超過"
+        next_frame = self.frame_at_index(target_index)
+        if next_frame is None:
+            return f"mosaic{slot}: フレーム読込失敗"
+        result = track_rect(anchor_frame, next_frame, anchor_rect)
+        if result is None:
+            return f"mosaic{slot}: 失敗"
+        tracked_rect, score, method = result
+        tracked_rect = clamp_rect(tracked_rect, next_frame.shape[1], next_frame.shape[0])
+        span = max(1, target_index - anchor_index)
+        for idx in range(anchor_index + 1, target_index + 1):
+            t = (idx - anchor_index) / span
+            fill_rect = tracked_rect if idx == target_index else interpolate_rect(anchor_rect, tracked_rect, t)
+            target_row = self.data.rows[idx]
+            set_rect(target_row, slot, clamp_rect(fill_rect, next_frame.shape[1], next_frame.shape[0]), on=True)
+            target_row[f"mosaic{slot}_type"] = label
+            target_row[f"mosaic{slot}_score"] = f"track:{score:.3f}" if idx == target_index else "track:interpolated"
+            self.update_frame_table_row(idx, target_row)
+        self.auto_track_anchors[slot] = (target_index, QRect(tracked_rect), next_frame.copy(), label)
+        self.mark_dirty()
+        frame_no = self.data.rows[target_index].get("frame_no", "")
+        gap_text = f", gap={gap}" if gap else ""
+        return f"mosaic{slot}: frame {frame_no} ({method}, score={score:.3f}{gap_text})"
+
+    def max_interpolate_gap(self) -> int:
+        try:
+            return max(0, int(self.data.meta_dict.get("interpolate_gap", "0")))
+        except ValueError:
+            return 0
 
     def keyPressEvent(self, event) -> None:
         super().keyPressEvent(event)
@@ -1023,8 +1240,10 @@ class EditorWindow(QMainWindow):
         if QMessageBox.question(self, "保存確認", f"{self.csv_path} を上書き保存しますか？") != QMessageBox.StandardButton.Yes:
             return
         write_pre_csv(self.csv_path, self.data)
+        self.original_rows = [dict(row) for row in self.data.rows]
         self.dirty = False
         self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
+        self.populate_frame_table()
 
     def closeEvent(self, event) -> None:
         if self.dirty:
