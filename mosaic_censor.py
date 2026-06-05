@@ -728,7 +728,7 @@ def boxes_from_csv_row(row: dict[str, str]) -> list[tuple[int, int, int, int]]:
 
 def process_video(
     input_path: str,
-    output_path: str,
+    output_path: str | None,
     intensity: int,
     effect: str,
     confidence: float,
@@ -744,6 +744,7 @@ def process_video(
     no_crotch: bool = False,
     csv_path: str | None = None,
     render_debug_to_output: bool = False,
+    csv_only: bool = False,
 ) -> None:
     def _log(msg: str) -> None:
         if log_file:
@@ -798,10 +799,10 @@ def process_video(
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     process_frames = end_frame - start_frame + 1
 
-    tmp_video_path = output_path + ".tmp_noaudio.mp4"
+    tmp_video_path = (output_path + ".tmp_noaudio.mp4") if output_path and not csv_only else None
     writer = cv2.VideoWriter(
         tmp_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-    )
+    ) if tmp_video_path else None
 
     tmp_debug_path = (debug_path + ".tmp_noaudio.mp4") if debug_path else None
     debug_writer = cv2.VideoWriter(
@@ -847,22 +848,26 @@ def process_video(
         nsfw_detection_count: int,
         fidx: int,
     ) -> None:
+        if csv_writer:
+            csv_writer.writerow(mosaic_csv_row(
+                fidx, apply_bxs, srch_bxs, nsfw_detection_count, nnet_bxs
+            ))
+        if writer is None and debug_writer is None:
+            return
+
         res = frm.copy()
         for box, _ in apply_bxs:
             res = apply_censor_effect(res, *box, intensity, effect)
         if render_debug_to_output or debug_writer:
             dbg = draw_debug_frame(res, pose_res, srch_bxs, nnet_bxs,
                                    confidence, nw_bxs, apply_bxs, fidx)
-        if render_debug_to_output:
-            writer.write(dbg)
-        else:
-            writer.write(res)
+        if writer:
+            if render_debug_to_output:
+                writer.write(dbg)
+            else:
+                writer.write(res)
         if debug_writer:
             debug_writer.write(dbg)
-        if csv_writer:
-            csv_writer.writerow(mosaic_csv_row(
-                fidx, apply_bxs, srch_bxs, nsfw_detection_count, nnet_bxs
-            ))
 
     def _flush_pending(force: bool = False) -> None:
         nonlocal pending_frames, previous_positive_boxes, previous_positive_idx
@@ -1008,14 +1013,16 @@ def process_video(
                     pbar.update(1)
     finally:
         cap.release()
-        writer.release()
+        if writer:
+            writer.release()
         if debug_writer:
             debug_writer.release()
         if csv_file:
             csv_file.close()
 
-    _log("音声をマージ中...")
-    merge_audio_from_source(input_path, tmp_video_path, output_path, start_frame, fps)
+    if tmp_video_path and output_path:
+        _log("音声をマージ中...")
+        merge_audio_from_source(input_path, tmp_video_path, output_path, start_frame, fps)
 
     if debug_path:
         _log("デバッグ動画をマージ中...")
@@ -1300,7 +1307,7 @@ def main() -> None:
     )
     parser.add_argument("input", help="入力 MP4 ファイルのパス（--post の場合は CSV ファイル）")
     parser.add_argument("--pre", action="store_true",
-                        help="目視確認用の _pre.mp4 と編集用CSVを作成する")
+                        help="編集用の _pre.csv を作成する（動画は作成しない）")
     parser.add_argument("--post", action="store_true",
                         help="CSVを読み込み、source_video から _post.mp4 を作成する")
     parser.add_argument("--intensity", type=positive_int, default=15, metavar="N",
@@ -1335,7 +1342,6 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    check_ffmpeg()
     effect = args.effect or "mosaic"
 
     if not os.path.isfile(args.input):
@@ -1359,6 +1365,7 @@ def main() -> None:
     detector_suffix = detector_name_suffix(args.yolo_nsfw_model, args.pose_model)
     yolo_confidence = effective_yolo_confidence(args.yolo_nsfw_model, args.yolo_confidence)
     if args.post:
+        check_ffmpeg()
         output_path = str(post_output_path_from_csv(input_path_obj))
         log_path = str(output_path[:-4] + "_log.txt")
         meta, _ = read_csv_meta_and_rows(input_path_obj)
@@ -1426,12 +1433,10 @@ def main() -> None:
     if args.frames:
         range_suffix = f"_frames{args.frames[0]}-{args.frames[1]}"
     if args.pre:
-        output_path = str(Path(args.input).parent / f"{stem}{range_suffix}_pre.mp4")
         csv_path = str(Path(args.input).parent / f"{stem}{range_suffix}_pre.csv")
         log_path = str(Path(args.input).parent / f"{stem}{range_suffix}_pre_log.txt")
         with open(log_path, "w", encoding="utf-8") as lf:
             log(f"入力          : {args.input}", lf)
-            log(f"pre動画       : {output_path}", lf)
             log(f"CSV           : {csv_path}", lf)
             log(f"ログ          : {log_path}", lf)
             log(f"強度          : {args.intensity}", lf)
@@ -1451,7 +1456,7 @@ def main() -> None:
             try:
                 process_video(
                     input_path=args.input,
-                    output_path=output_path,
+                    output_path=None,
                     intensity=args.intensity,
                     effect=effect,
                     confidence=args.confidence,
@@ -1466,9 +1471,10 @@ def main() -> None:
                     pose_backend=args.pose_model,
                     no_crotch=args.no_crotch,
                     csv_path=csv_path,
-                    render_debug_to_output=True,
+                    render_debug_to_output=False,
+                    csv_only=True,
                 )
-                log(f"\n完了: {output_path}", lf)
+                log(f"\n完了: {csv_path}", lf)
             except KeyboardInterrupt:
                 print("\n中断されました", file=sys.stderr)
                 sys.exit(1)
@@ -1477,6 +1483,7 @@ def main() -> None:
                 sys.exit(1)
         return
 
+    check_ffmpeg()
     output_path = str(Path(args.input).parent / f"{stem}_{detector_suffix}{range_suffix}_censored.mp4")
     log_path = str(Path(args.input).parent / f"{stem}_{detector_suffix}{range_suffix}_log.txt")
     debug_path = str(Path(args.input).parent / f"{stem}_{detector_suffix}{range_suffix}_debug.mp4") if args.debug else None
