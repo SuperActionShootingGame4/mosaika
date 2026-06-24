@@ -38,6 +38,11 @@ jobs:
           .venv\Scripts\pip install -r requirements.txt
           .venv\Scripts\pip install pyinstaller
 
+      - name: Verify nudenet is installed
+        run: |
+          .venv\Scripts\pip show nudenet
+          .venv\Scripts\python -c "import nudenet; print('nudenet OK:', nudenet.__version__)"
+
       - name: Show installed packages (debug)
         run: .venv\Scripts\pip list
 
