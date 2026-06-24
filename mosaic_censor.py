@@ -64,6 +64,13 @@ CENSOR_EFFECTS = ("mosaic", "blur")
 MAX_CSV_MOSAICS = 255
 
 
+def get_base_dir() -> Path:
+    """Return the directory containing resource files (PyInstaller-aware)."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
 def load_pose_model(backend: str):
     """
     ポーズ検出モデルをロードして返す。
@@ -879,7 +886,7 @@ def process_video(
         sys.exit(1)
 
     _log("モデル初期化中...")
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "640m.onnx")
+    model_path = str(get_base_dir() / "640m.onnx")
     detector = NudeDetector(model_path=model_path, inference_resolution=640,
                             providers=["CPUExecutionProvider"])
     _log(f"ポーズモデル: {pose_backend}")
@@ -1194,7 +1201,7 @@ def process_single_frame(
         raise RuntimeError(f"フレームを読み込めません: {frame_number}")
 
     _log("モデル初期化中...")
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "640m.onnx")
+    model_path = str(get_base_dir() / "640m.onnx")
     detector = NudeDetector(model_path=model_path, inference_resolution=640,
                             providers=["CPUExecutionProvider"])
     _log(f"ポーズモデル: {pose_backend}")

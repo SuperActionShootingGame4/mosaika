@@ -77,7 +77,12 @@ MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
 TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
-CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
+def _get_config_path() -> Path:
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent / "config.toml"
+    return Path(__file__).resolve().parent / "config.toml"
+
+CONFIG_PATH = _get_config_path()
 RECIPE_CONFIG_SECTION = "recipe_generation"
 DISPLAY_SEQUENTIAL_MAX_SKIP = 120
 
