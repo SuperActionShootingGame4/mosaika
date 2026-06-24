@@ -50,11 +50,21 @@ jobs:
           Write-Host "640m.onnx: $size bytes"
         shell: pwsh
 
-      - name: Build mosaika (editor + CLI)
-        run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika.spec
+      - name: Build mosaika-editor (GUI)
+        run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_editor.spec
 
-      - name: Copy NudeNet model to dist
-        run: copy 640m.onnx dist\mosaika\
+      - name: Build mosaika-cli (CLI)
+        run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_cli.spec
+
+      - name: Combine into dist/mosaika/
+        shell: pwsh
+        run: |
+          # editor ディレクトリを mosaika にリネーム
+          Rename-Item dist\mosaika-editor dist\mosaika
+          # CLI exe だけをコピー（_internal/ は editor のものを共用）
+          Copy-Item dist\mosaika-cli\mosaika-cli.exe dist\mosaika\
+          # NudeNet モデルをコピー
+          Copy-Item 640m.onnx dist\mosaika\
 
       - name: Upload mosaika
         uses: actions/upload-artifact@v4

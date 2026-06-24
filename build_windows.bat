@@ -7,7 +7,6 @@ set SCRIPT_DIR=%~dp0
 echo === Mosaika Windows ビルド ===
 echo.
 
-REM venv の Python を使う
 set PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe
 if not exist "%PYTHON%" (
     echo エラー: .venv が見つかりません。
@@ -19,32 +18,33 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
-REM PyInstaller のバージョン確認
 "%PYTHON%" -m PyInstaller --version > nul 2>&1
 if errorlevel 1 (
     echo PyInstaller が見つかりません。インストールします...
     "%PYTHON%" -m pip install pyinstaller
 )
 
-REM 640m.onnx の存在確認
 if not exist "%SCRIPT_DIR%640m.onnx" (
     echo エラー: 640m.onnx が見つかりません。
     echo NudeNet のモデルファイルをスクリプトと同じフォルダに置いてください。
-    echo 取得先: https://github.com/notAI-tech/NudeNet/releases ^(v3.4-weights^)
     pause
     exit /b 1
 )
 
-echo ビルド中 ^(editor + CLI → dist\mosaika\^)...
-"%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika.spec"
-if errorlevel 1 (
-    echo ビルドに失敗しました。
-    pause
-    exit /b 1
-)
+echo [1/2] mosaika-editor ^(GUI^) をビルド中...
+"%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_editor.spec"
+if errorlevel 1 ( echo ビルド失敗 & pause & exit /b 1 )
 
 echo.
-echo モデルファイルを dist\mosaika\ にコピー中...
+echo [2/2] mosaika-cli ^(CLI^) をビルド中...
+"%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_cli.spec"
+if errorlevel 1 ( echo ビルド失敗 & pause & exit /b 1 )
+
+echo.
+echo dist\mosaika\ にまとめています...
+if exist "%SCRIPT_DIR%dist\mosaika" rmdir /s /q "%SCRIPT_DIR%dist\mosaika"
+rename "%SCRIPT_DIR%dist\mosaika-editor" mosaika
+copy "%SCRIPT_DIR%dist\mosaika-cli\mosaika-cli.exe" "%SCRIPT_DIR%dist\mosaika\" > nul
 copy "%SCRIPT_DIR%640m.onnx" "%SCRIPT_DIR%dist\mosaika\" > nul
 
 echo.
@@ -54,10 +54,8 @@ echo 出力先: dist\mosaika\
 echo   mosaika-editor.exe  ... GUI エディタ
 echo   mosaika-cli.exe     ... CLI ツール
 echo.
-echo 注意事項:
-echo   - ffmpeg を PATH に通すか dist\mosaika\ 内に ffmpeg.exe を置いてください
-echo   - YOLO ポーズモデル ^(yolo11l-pose.pt など^) は初回実行時に自動ダウンロードされます
-echo   - config.toml は mosaika-editor.exe と同じフォルダに自動生成されます
-echo   - 640m.onnx は dist\mosaika\ にコピー済みです
+echo 注意:
+echo   - ffmpeg を PATH に通すか dist\mosaika\ に ffmpeg.exe を置いてください
+echo   - YOLO モデルは初回実行時に自動ダウンロードされます
 echo.
 pause
