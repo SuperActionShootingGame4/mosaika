@@ -42,15 +42,7 @@ jobs:
           .venv\Scripts\python -c "from PyQt6.QtWidgets import QApplication; print('PyQt6 OK')"
 
       - name: Show collect_all result for PyQt6 (debug)
-        run: >-
-          .venv\Scripts\python -c "
-          from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files;
-          d,b,h = collect_all('PyQt6');
-          print(f'collect_all => datas:{len(d)} binaries:{len(b)} hiddenimports:{len(h)}');
-          print('first 3 datas:', d[:3]);
-          print('first 3 binaries:', b[:3]);
-          print('first 3 hiddenimports:', h[:3])
-          "
+        run: .venv\Scripts\python ci_debug_pyqt6.py
 
       - name: Show installed packages (debug)
         run: .venv\Scripts\pip list
