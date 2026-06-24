@@ -1,7 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec — editor と CLI を dist/mosaika/ にまとめてビルド
 
+from PyInstaller.utils.hooks import collect_all
+
 block_cipher = None
+
+# PyQt6 は hiddenimports だけでは不十分。データ・バイナリも含めて全収集する
+qt_datas, qt_binaries, qt_hiddenimports = collect_all('PyQt6')
 
 COMMON_HIDDENIMPORTS = [
     'nudenet',
@@ -39,14 +44,9 @@ COMMON_EXCLUDES = [
 a_editor = Analysis(
     ['pre_csv_editor.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    hiddenimports=COMMON_HIDDENIMPORTS + [
-        'PyQt6',
-        'PyQt6.QtCore',
-        'PyQt6.QtGui',
-        'PyQt6.QtWidgets',
-        'PyQt6.sip',
+    binaries=qt_binaries,
+    datas=qt_datas,
+    hiddenimports=COMMON_HIDDENIMPORTS + qt_hiddenimports + [
         'mosaic_censor',
     ],
     hookspath=[],
