@@ -19,7 +19,7 @@ except ImportError:
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -1436,6 +1436,8 @@ class EditorWindow(QMainWindow):
         self.setCentralWidget(label)
 
     def load_csv(self, csv_path: Path) -> None:
+        if hasattr(self, "playback_active") and self.playback_active:
+            self.stop_preview_playback()
         if self.cap is not None:
             self.cap.release()
             self.cap = None
@@ -1467,6 +1469,10 @@ class EditorWindow(QMainWindow):
         self.pose_overlay_cache: dict[int, tuple[list[tuple[int, int, int, int]], list[np.ndarray]]] = {}
         self.keep_range_start: int | None = None
         self.keep_range_end: int | None = None
+        self.playback_timer = QTimer(self)
+        self.playback_timer.timeout.connect(self.playback_next_frame)
+        self.playback_index: int | None = None
+        self.playback_active = False
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
         self.build_ui(show_load_progress=True)
@@ -1552,12 +1558,14 @@ class EditorWindow(QMainWindow):
         self.keep_add_button = QPushButton("残す範囲決定")
         self.keep_list_button = QPushButton("残す範囲一覧")
         self.keep_clear_button = QPushButton("残す範囲クリア")
+        self.preview_play_button = QPushButton("仮再生")
         for button in (
             self.keep_start_button,
             self.keep_end_button,
             self.keep_add_button,
             self.keep_list_button,
             self.keep_clear_button,
+            self.preview_play_button,
         ):
             fit_button_to_text(button)
         trimming_group = QGroupBox("トリミング")
@@ -1568,6 +1576,7 @@ class EditorWindow(QMainWindow):
         trim_layout.addWidget(self.keep_add_button)
         trim_layout.addWidget(self.keep_list_button)
         trim_layout.addWidget(self.keep_clear_button)
+        trim_layout.addWidget(self.preview_play_button)
         trim_layout.addStretch()
         trimming_group_layout.addLayout(trim_layout)
         left_layout.addWidget(trimming_group)
@@ -1687,6 +1696,7 @@ class EditorWindow(QMainWindow):
         self.keep_add_button.clicked.connect(self.add_current_selection_keep_range)
         self.keep_list_button.clicked.connect(self.show_keep_ranges)
         self.keep_clear_button.clicked.connect(self.clear_keep_ranges)
+        self.preview_play_button.clicked.connect(self.toggle_preview_playback)
         self.preview_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.crotch_overlay_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.skeleton_overlay_checkbox.stateChanged.connect(self.refresh_canvas_frame)
@@ -1831,6 +1841,88 @@ class EditorWindow(QMainWindow):
         h, w = rgb.shape[:2]
         qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
         self.canvas.set_frame(QPixmap.fromImage(qimg), (w, h))
+
+    def render_recipe_frame(self, frame: np.ndarray, row: dict[str, str]) -> np.ndarray:
+        result = frame.copy()
+        meta = self.data.meta_dict
+        try:
+            intensity = max(1, int(meta.get("intensity", "15")))
+        except ValueError:
+            intensity = 15
+        effect = meta.get("effect", "mosaic")
+        for slot in range(1, MAX_MOSAICS + 1):
+            if not is_on(row.get(f"mosaic{slot}_on")):
+                continue
+            rect = get_rect(row, slot)
+            if rect is not None:
+                apply_preview_effect(result, rect, intensity, effect)
+        return result
+
+    def show_playback_frame(self, index: int) -> bool:
+        frame = self.frame_at_index(index)
+        if frame is None:
+            return False
+        row = self.data.rows[index]
+        rendered = self.render_recipe_frame(frame, row)
+        rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
+        self.canvas.set_frame(QPixmap.fromImage(qimg), (w, h))
+        self.current_index = index
+        self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}")
+        self.frame_input.setText(row.get("frame_no", ""))
+        self.sequence_slider.blockSignals(True)
+        self.sequence_slider.setValue(self.current_index)
+        self.sequence_slider.blockSignals(False)
+        self.select_current_frame_row()
+        return True
+
+    def next_kept_index(self, start_index: int) -> int | None:
+        keep_ranges = self.keep_ranges()
+        for idx in range(max(0, start_index), len(self.data.rows)):
+            if self.frame_is_kept(self.data.rows[idx], keep_ranges):
+                return idx
+        return None
+
+    def toggle_preview_playback(self) -> None:
+        if self.playback_active:
+            self.stop_preview_playback()
+            return
+        start_index = self.next_kept_index(self.current_index)
+        if start_index is None:
+            QMessageBox.information(self, "仮再生", "再生できる残す範囲がありません。")
+            return
+        self.playback_active = True
+        self.playback_index = start_index
+        self.preview_play_button.setText("停止")
+        fit_button_to_text(self.preview_play_button)
+        fps = self.cap.get(cv2.CAP_PROP_FPS) if self.cap is not None else 30
+        interval_ms = max(1, round(1000 / fps)) if fps and fps > 0 else 33
+        self.playback_timer.start(interval_ms)
+        self.playback_next_frame()
+
+    def stop_preview_playback(self) -> None:
+        if not self.playback_active:
+            return
+        self.playback_timer.stop()
+        self.playback_active = False
+        self.playback_index = None
+        self.preview_play_button.setText("仮再生")
+        fit_button_to_text(self.preview_play_button)
+        self.load_frame()
+
+    def playback_next_frame(self) -> None:
+        if self.playback_index is None:
+            self.stop_preview_playback()
+            return
+        index = self.next_kept_index(self.playback_index)
+        if index is None:
+            self.stop_preview_playback()
+            return
+        if not self.show_playback_frame(index):
+            self.stop_preview_playback()
+            return
+        self.playback_index = index + 1
 
     def current_pose_overlay(self) -> tuple[list[tuple[int, int, int, int]], list[np.ndarray]] | None:
         if self.source_frame is None:
@@ -2354,6 +2446,8 @@ class EditorWindow(QMainWindow):
     def move_to_index(self, target_index: int) -> None:
         if target_index == self.current_index:
             return
+        if self.playback_active:
+            self.stop_preview_playback()
         self.current_index = target_index
         self.load_frame()
 
@@ -2521,6 +2615,8 @@ class EditorWindow(QMainWindow):
         dialog.exec()
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, "playback_active") and self.playback_active:
+            self.stop_preview_playback()
         if self.dirty:
             result = QMessageBox.question(self, "未保存", "未保存の変更があります。閉じますか？")
             if result != QMessageBox.StandardButton.Yes:
