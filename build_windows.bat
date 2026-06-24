@@ -35,6 +35,10 @@ echo [1/2] mosaika-editor ^(GUI^) をビルド中...
 "%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_editor.spec"
 if errorlevel 1 ( echo ビルド失敗 & pause & exit /b 1 )
 
+echo PyQt6 を _internal\ にコピー中...
+for /f "delims=" %%i in ('"%PYTHON%" -c "import site; print(site.getsitepackages()[0])"') do set SITE=%%i
+xcopy /e /i /y "%SITE%\PyQt6" "%SCRIPT_DIR%dist\mosaika-editor\_internal\PyQt6" > nul
+
 echo.
 echo [2/2] mosaika-cli ^(CLI^) をビルド中...
 "%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_cli.spec"

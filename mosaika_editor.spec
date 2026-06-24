@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for mosaika-editor (GUI)
-
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+# PyQt6 は PyInstaller に収集させず、ビルド後に venv から _internal/ へ直接コピーする
 
 block_cipher = None
 
@@ -9,36 +8,33 @@ a = Analysis(
     ['pre_csv_editor.py'],
     pathex=[],
     binaries=[],
-    datas=collect_data_files('PyQt6'),
-    hiddenimports=(
-        collect_submodules('PyQt6')
-        + [
-            'nudenet',
-            'onnxruntime',
-            'onnxruntime.capi',
-            'onnxruntime.capi.onnxruntime_pybind11_state',
-            'cv2',
-            'numpy',
-            'tqdm',
-            'mosaic_censor',
-            'ultralytics',
-            'ultralytics.engine',
-            'ultralytics.engine.model',
-            'ultralytics.engine.predictor',
-            'ultralytics.engine.results',
-            'ultralytics.nn',
-            'ultralytics.nn.modules',
-            'ultralytics.nn.tasks',
-            'ultralytics.utils',
-            'ultralytics.utils.ops',
-            'ultralytics.utils.plotting',
-            'ultralytics.utils.torch_utils',
-            'ultralytics.models',
-            'ultralytics.models.yolo',
-            'ultralytics.models.yolo.detect',
-            'ultralytics.models.yolo.pose',
-        ]
-    ),
+    datas=[],
+    hiddenimports=[
+        'nudenet',
+        'onnxruntime',
+        'onnxruntime.capi',
+        'onnxruntime.capi.onnxruntime_pybind11_state',
+        'cv2',
+        'numpy',
+        'tqdm',
+        'mosaic_censor',
+        'ultralytics',
+        'ultralytics.engine',
+        'ultralytics.engine.model',
+        'ultralytics.engine.predictor',
+        'ultralytics.engine.results',
+        'ultralytics.nn',
+        'ultralytics.nn.modules',
+        'ultralytics.nn.tasks',
+        'ultralytics.utils',
+        'ultralytics.utils.ops',
+        'ultralytics.utils.plotting',
+        'ultralytics.utils.torch_utils',
+        'ultralytics.models',
+        'ultralytics.models.yolo',
+        'ultralytics.models.yolo.detect',
+        'ultralytics.models.yolo.pose',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

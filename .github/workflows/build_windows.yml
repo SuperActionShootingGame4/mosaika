@@ -60,18 +60,15 @@ jobs:
       - name: Build mosaika-editor (GUI)
         run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_editor.spec
 
-      - name: Check PyQt6 in built bundle (debug)
+      - name: Copy PyQt6 into _internal/ (PyInstaller収集をバイパス)
         shell: pwsh
         run: |
-          $internal = "dist\mosaika-editor\_internal"
-          if (Test-Path "$internal\PyQt6") {
-            Write-Host "OK: _internal\PyQt6\ exists"
-            Get-ChildItem "$internal\PyQt6" | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.Name)" }
-          } else {
-            Write-Host "NG: _internal\PyQt6\ NOT FOUND"
-            Write-Host "Contents of _internal\:"
-            Get-ChildItem $internal | Select-Object -First 20 | ForEach-Object { Write-Host "  $($_.Name)" }
-          }
+          $site = (& .venv\Scripts\python -c "import site; print(site.getsitepackages()[0])")
+          Write-Host "site-packages: $site"
+          $dst = "dist\mosaika-editor\_internal\PyQt6"
+          Copy-Item "$site\PyQt6" $dst -Recurse -Force
+          Write-Host "Copied PyQt6 -> $dst"
+          Get-ChildItem $dst | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.Name)" }
 
       - name: Build mosaika-cli (CLI)
         run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_cli.spec
