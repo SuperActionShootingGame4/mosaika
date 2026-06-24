@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -38,41 +38,18 @@ jobs:
           .venv\Scripts\pip install -r requirements.txt
           .venv\Scripts\pip install pyinstaller
 
-      - name: Download NudeNet model (640m.onnx)
-        shell: python
+      - name: Show installed packages (debug)
+        run: .venv\Scripts\pip list
+
+      - name: Prepare NudeNet model (640m.onnx)
+        run: .venv\Scripts\python ci_prepare_model.py
+
+      - name: Verify 640m.onnx
         run: |
-          import os, sys, shutil
-          from pathlib import Path
-
-          dest = Path("640m.onnx")
-          if dest.exists():
-              print("640m.onnx already present")
-              sys.exit(0)
-
-          # NudeDetector() without model_path triggers auto-download
-          try:
-              from nudenet import NudeDetector
-              _d = NudeDetector()
-          except Exception as e:
-              print(f"Init attempt: {e}")
-
-          # Search known locations
-          search_roots = [
-              Path(os.environ.get("APPDATA", "")) / "nudenet",
-              Path.home() / ".nudenet",
-              Path.home() / ".cache" / "nudenet",
-          ]
-          import nudenet
-          search_roots.insert(0, Path(nudenet.__file__).parent)
-
-          for root in search_roots:
-              for p in root.rglob("*.onnx"):
-                  shutil.copy(p, dest)
-                  print(f"Copied model from {p}")
-                  sys.exit(0)
-
-          print("ERROR: 640m.onnx not found after download attempt")
-          sys.exit(1)
+          if (!(Test-Path "640m.onnx")) { Write-Error "640m.onnx missing"; exit 1 }
+          $size = (Get-Item "640m.onnx").length
+          Write-Host "640m.onnx: $size bytes"
+        shell: pwsh
 
       - name: Build mosaika-editor (GUI)
         run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_editor.spec
@@ -85,14 +62,14 @@ jobs:
           copy 640m.onnx dist\mosaika-editor\
           copy 640m.onnx dist\mosaika-cli\
 
-      - name: Upload mosaika-editor artifact
+      - name: Upload mosaika-editor
         uses: actions/upload-artifact@v4
         with:
           name: mosaika-editor-windows
           path: dist/mosaika-editor/
           retention-days: 30
 
-      - name: Upload mosaika-cli artifact
+      - name: Upload mosaika-cli
         uses: actions/upload-artifact@v4
         with:
           name: mosaika-cli-windows
