@@ -6,18 +6,24 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import tomllib
+import time
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -26,6 +32,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -39,7 +46,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from mosaic_censor import SKELETON_EDGES, get_crotch_boxes, load_pose_model
+from mosaic_censor import (
+    CENSOR_EFFECTS,
+    POSE_BACKENDS,
+    SKELETON_EDGES,
+    effective_yolo_confidence,
+    get_crotch_boxes,
+    load_pose_model,
+    post_output_path_from_csv,
+    process_post_from_csv,
+    process_video,
+)
 
 MAX_MOSAICS = 255
 DEFAULT_VISIBLE_MOSAICS = 5
@@ -50,6 +67,518 @@ MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
 TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
+CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
+RECIPE_CONFIG_SECTION = "recipe_generation"
+
+
+class RecipeGenerationCancelled(Exception):
+    pass
+
+
+def progress_text(current: int, total: int, elapsed: float) -> str:
+    if current <= 0 or total <= 0:
+        return "準備中..."
+    remaining = max(0.0, elapsed * (total - current) / current)
+    return f"{current}/{total} frame  残り {time.strftime('%H:%M:%S', time.gmtime(remaining))}"
+
+
+def load_recipe_config() -> dict:
+    if not CONFIG_PATH.is_file():
+        return {}
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return {}
+    section = data.get(RECIPE_CONFIG_SECTION, {})
+    return section if isinstance(section, dict) else {}
+
+
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def save_recipe_config(settings: dict) -> None:
+    lines = [
+        f"[{RECIPE_CONFIG_SECTION}]",
+        f"video_path = {toml_value(settings['video_path'])}",
+        f"pose_model = {toml_value(settings['pose_model'])}",
+        f"all_frames = {toml_value(settings['all_frames'])}",
+        f"start_frame = {toml_value(settings['start_frame'])}",
+        f"end_frame = {toml_value(settings['end_frame'])}",
+        f"confidence = {toml_value(settings['confidence'])}",
+        f"intensity = {toml_value(settings['intensity'])}",
+        f"effect = {toml_value(settings['effect'])}",
+        f"detect_every = {toml_value(settings['detect_every'])}",
+        f"interpolate_gap = {toml_value(settings['interpolate_gap'])}",
+        f"yolo_nsfw_model = {toml_value(settings['yolo_nsfw_model'])}",
+        f"yolo_confidence = {toml_value(settings['yolo_confidence'])}",
+        f"no_crotch = {toml_value(settings['no_crotch'])}",
+        f"skip_no_person = {toml_value(settings['skip_no_person'])}",
+        "",
+    ]
+    CONFIG_PATH.write_text("\n".join(lines), encoding="utf-8")
+
+
+def config_bool(config: dict, key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
+def config_int(config: dict, key: str, default: int, minimum: int, maximum: int) -> int:
+    value = config.get(key, default)
+    if not isinstance(value, int):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def config_float(config: dict, key: str, default: float, minimum: float, maximum: float) -> float:
+    value = config.get(key, default)
+    if not isinstance(value, int | float):
+        return default
+    return max(minimum, min(maximum, float(value)))
+
+
+def config_text(config: dict, key: str, default: str) -> str:
+    value = config.get(key, default)
+    return value if isinstance(value, str) else default
+
+
+class PreCreateWorker(QObject):
+    progress = pyqtSignal(int, int, float)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, video_path: Path, csv_path: Path, log_path: Path, options: dict) -> None:
+        super().__init__()
+        self.video_path = video_path
+        self.csv_path = csv_path
+        self.log_path = log_path
+        self.options = options
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def emit_progress(self, current: int, total: int, elapsed: float) -> None:
+        if self.cancel_requested:
+            raise RecipeGenerationCancelled()
+        self.progress.emit(current, total, elapsed)
+
+    def run(self) -> None:
+        try:
+            with open(self.log_path, "w", encoding="utf-8") as lf:
+                yolo_confidence = effective_yolo_confidence(
+                    self.options["yolo_nsfw_model"],
+                    self.options["yolo_confidence"],
+                )
+                process_video(
+                    input_path=str(self.video_path),
+                    output_path=None,
+                    intensity=self.options["intensity"],
+                    effect=self.options["effect"],
+                    confidence=self.options["confidence"],
+                    detect_every=self.options["detect_every"],
+                    log_file=lf,
+                    debug_path=None,
+                    interpolate=True,
+                    yolo_nsfw_model_path=self.options["yolo_nsfw_model"],
+                    yolo_confidence=yolo_confidence,
+                    max_interpolate_gap=self.options["interpolate_gap"],
+                    frame_range=self.options["frame_range"],
+                    pose_backend=self.options["pose_model"],
+                    no_crotch=self.options["no_crotch"],
+                    csv_path=str(self.csv_path),
+                    render_debug_to_output=False,
+                    csv_only=True,
+                    progress_callback=self.emit_progress,
+                    skip_no_person=self.options["skip_no_person"],
+                )
+            self.finished.emit(str(self.csv_path))
+        except RecipeGenerationCancelled:
+            self.csv_path.unlink(missing_ok=True)
+            self.failed.emit("レシピ生成をキャンセルしました。")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class PostWorker(QObject):
+    progress = pyqtSignal(int, int, float)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, csv_path: Path, output_path: Path, log_path: Path) -> None:
+        super().__init__()
+        self.csv_path = csv_path
+        self.output_path = output_path
+        self.log_path = log_path
+
+    def run(self) -> None:
+        try:
+            with open(self.log_path, "w", encoding="utf-8") as lf:
+                process_post_from_csv(
+                    csv_path=str(self.csv_path),
+                    output_path=str(self.output_path),
+                    log_file=lf,
+                    progress_callback=self.progress.emit,
+                )
+            self.finished.emit(str(self.output_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class PreCreateDialog(QDialog):
+    def __init__(self, video_path: Path) -> None:
+        super().__init__()
+        self.config = load_recipe_config()
+        self.video_path = video_path
+        self.result_csv: Path | None = None
+        self.thread: QThread | None = None
+        self.worker: PreCreateWorker | None = None
+        self.worker_failed = False
+        self.running = False
+        self.setWindowTitle("レシピ生成ウィンドウ")
+        self.resize(520, 360)
+        self.total_frames = self.detect_total_frames()
+        self.build_ui()
+
+    def detect_total_frames(self) -> int:
+        cap = cv2.VideoCapture(str(self.video_path))
+        try:
+            if not cap.isOpened():
+                return 0
+            return max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        finally:
+            cap.release()
+
+    def build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.video_path_input = QLineEdit(str(self.video_path))
+        self.browse_video_button = QPushButton("参照")
+        self.browse_video_button.clicked.connect(self.select_video)
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(self.video_path_input, stretch=1)
+        video_layout.addWidget(self.browse_video_button)
+
+        self.pose_combo = QComboBox()
+        self.pose_combo.addItems(list(POSE_BACKENDS))
+        pose_model = config_text(self.config, "pose_model", "yolo11")
+        self.pose_combo.setCurrentText(pose_model if pose_model in POSE_BACKENDS else "yolo11")
+        self.effect_combo = QComboBox()
+        self.effect_combo.addItems(list(CENSOR_EFFECTS))
+        effect = config_text(self.config, "effect", "mosaic")
+        self.effect_combo.setCurrentText(effect if effect in CENSOR_EFFECTS else "mosaic")
+        self.confidence_spin = QDoubleSpinBox()
+        self.confidence_spin.setRange(0.0, 1.0)
+        self.confidence_spin.setDecimals(3)
+        self.confidence_spin.setSingleStep(0.01)
+        self.confidence_spin.setValue(config_float(self.config, "confidence", 0.03, 0.0, 1.0))
+        self.intensity_spin = QSpinBox()
+        self.intensity_spin.setRange(1, 10000)
+        self.intensity_spin.setValue(config_int(self.config, "intensity", 15, 1, 10000))
+        self.detect_every_spin = QSpinBox()
+        self.detect_every_spin.setRange(1, 10000)
+        self.detect_every_spin.setValue(config_int(self.config, "detect_every", 1, 1, 10000))
+        self.interpolate_gap_spin = QSpinBox()
+        self.interpolate_gap_spin.setRange(0, 10000)
+        self.interpolate_gap_spin.setValue(config_int(self.config, "interpolate_gap", 10, 0, 10000))
+        self.no_crotch_check = QCheckBox("股間領域フィルタを無効化")
+        self.no_crotch_check.setChecked(config_bool(self.config, "no_crotch", False))
+        self.skip_no_person_check = QCheckBox("人物がいないフレームは検出をスキップ")
+        self.skip_no_person_check.setChecked(config_bool(self.config, "skip_no_person", False))
+        self.all_frames_check = QCheckBox("全フレーム")
+        self.all_frames_check.setChecked(config_bool(self.config, "all_frames", True))
+        self.start_spin = QSpinBox()
+        self.end_spin = QSpinBox()
+        max_frame = max(0, self.total_frames - 1)
+        for spin in (self.start_spin, self.end_spin):
+            spin.setRange(0, max_frame)
+            spin.setEnabled(not self.all_frames_check.isChecked())
+        self.start_spin.setValue(config_int(self.config, "start_frame", 0, 0, max_frame))
+        self.end_spin.setValue(config_int(self.config, "end_frame", max_frame, 0, max_frame))
+        self.yolo_model_input = QLineEdit()
+        self.yolo_model_input.setText(config_text(self.config, "yolo_nsfw_model", ""))
+        self.yolo_confidence_spin = QDoubleSpinBox()
+        self.yolo_confidence_spin.setRange(0.0, 1.0)
+        self.yolo_confidence_spin.setDecimals(3)
+        self.yolo_confidence_spin.setSingleStep(0.01)
+        self.yolo_confidence_spin.setSpecialValueText("自動")
+        self.yolo_confidence_spin.setValue(config_float(self.config, "yolo_confidence", 0.0, 0.0, 1.0))
+        browse_yolo = QPushButton("参照")
+        browse_yolo.clicked.connect(self.select_yolo_model)
+        yolo_layout = QHBoxLayout()
+        yolo_layout.addWidget(self.yolo_model_input, stretch=1)
+        yolo_layout.addWidget(browse_yolo)
+        frame_layout = QHBoxLayout()
+        frame_layout.addWidget(self.start_spin)
+        frame_layout.addWidget(QLabel("-"))
+        frame_layout.addWidget(self.end_spin)
+
+        form.addRow("動画ファイル", video_layout)
+        form.addRow("pose_model", self.pose_combo)
+        form.addRow("frames", frame_layout)
+        form.addRow("", self.all_frames_check)
+        form.addRow("confidence ※検出の信頼度しきい値", self.confidence_spin)
+        form.addRow("intensity ※モザイク/ぼかしの強度", self.intensity_spin)
+        form.addRow("effect", self.effect_combo)
+        form.addRow("detect_every ※何フレームごとにAI検出するか", self.detect_every_spin)
+        form.addRow("interpolate_gap ※検出漏れを補間する最大フレーム数", self.interpolate_gap_spin)
+        form.addRow("yolo_nsfw_model ※未選択時はNudeNetを使用", yolo_layout)
+        form.addRow("yolo_confidence", self.yolo_confidence_spin)
+        form.addRow("", self.no_crotch_check)
+        form.addRow("", self.skip_no_person_check)
+        layout.addLayout(form)
+
+        self.progress_bar = QProgressBar()
+        self.progress_label = QLabel("未実行")
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.progress_label)
+        self.buttons = QDialogButtonBox()
+        self.start_button = self.buttons.addButton("レシピ生成", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.cancel_button = self.buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
+        layout.addWidget(self.buttons)
+
+        self.all_frames_check.stateChanged.connect(self.update_frame_enabled)
+        self.video_path_input.editingFinished.connect(self.update_video_path_from_input)
+        self.start_button.clicked.connect(self.start_pre_create)
+        self.cancel_button.clicked.connect(self.cancel_or_reject)
+
+    def update_frame_enabled(self) -> None:
+        enabled = not self.all_frames_check.isChecked()
+        self.start_spin.setEnabled(enabled)
+        self.end_spin.setEnabled(enabled)
+
+    def select_yolo_model(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "YOLO NSFWモデルを選択", "", "Model (*.pt);;All files (*)")
+        if selected:
+            self.yolo_model_input.setText(selected)
+
+    def select_video(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "動画ファイルを選択",
+            str(self.video_path.parent),
+            "Video (*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv *.MKV);;All files (*)",
+        )
+        if selected:
+            self.video_path_input.setText(selected)
+            self.update_video_path_from_input()
+
+    def update_video_path_from_input(self) -> None:
+        video_path = Path(self.video_path_input.text().strip()).expanduser()
+        if video_path == self.video_path:
+            return True
+        if not video_path.is_file():
+            QMessageBox.warning(self, "Error", f"動画ファイルが見つかりません: {video_path}")
+            self.video_path_input.setText(str(self.video_path))
+            return False
+        self.video_path = video_path
+        self.total_frames = self.detect_total_frames()
+        max_frame = max(0, self.total_frames - 1)
+        for spin in (self.start_spin, self.end_spin):
+            spin.setMaximum(max_frame)
+        self.start_spin.setValue(0)
+        self.end_spin.setValue(max_frame)
+        return True
+
+    def output_paths(self) -> tuple[Path, Path]:
+        range_suffix = ""
+        frame_range = self.frame_range()
+        if frame_range is not None:
+            range_suffix = f"_frames{frame_range[0]}-{frame_range[1]}"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = self.video_path.stem
+        csv_path = self.video_path.with_name(f"{stem}{range_suffix}_pre_{stamp}.csv")
+        log_path = self.video_path.with_name(f"{stem}{range_suffix}_pre_{stamp}_log.txt")
+        return csv_path, log_path
+
+    def frame_range(self) -> tuple[int, int] | None:
+        if self.all_frames_check.isChecked():
+            return None
+        return self.start_spin.value(), self.end_spin.value()
+
+    def current_settings(self) -> dict:
+        return {
+            "video_path": str(self.video_path),
+            "pose_model": self.pose_combo.currentText(),
+            "all_frames": self.all_frames_check.isChecked(),
+            "start_frame": self.start_spin.value(),
+            "end_frame": self.end_spin.value(),
+            "confidence": self.confidence_spin.value(),
+            "intensity": self.intensity_spin.value(),
+            "effect": self.effect_combo.currentText(),
+            "detect_every": self.detect_every_spin.value(),
+            "interpolate_gap": self.interpolate_gap_spin.value(),
+            "yolo_nsfw_model": self.yolo_model_input.text().strip(),
+            "yolo_confidence": self.yolo_confidence_spin.value(),
+            "no_crotch": self.no_crotch_check.isChecked(),
+            "skip_no_person": self.skip_no_person_check.isChecked(),
+        }
+
+    def start_pre_create(self) -> None:
+        if not self.update_video_path_from_input():
+            return
+        frame_range = self.frame_range()
+        if frame_range is not None and frame_range[1] < frame_range[0]:
+            QMessageBox.warning(self, "Error", "フレーム範囲が不正です")
+            return
+        save_recipe_config(self.current_settings())
+        csv_path, log_path = self.output_paths()
+        yolo_model = self.yolo_model_input.text().strip() or None
+        yolo_conf = None if self.yolo_confidence_spin.value() <= 0 else self.yolo_confidence_spin.value()
+        options = {
+            "pose_model": self.pose_combo.currentText(),
+            "frame_range": frame_range,
+            "confidence": self.confidence_spin.value(),
+            "intensity": self.intensity_spin.value(),
+            "effect": self.effect_combo.currentText(),
+            "no_crotch": self.no_crotch_check.isChecked(),
+            "detect_every": self.detect_every_spin.value(),
+            "interpolate_gap": self.interpolate_gap_spin.value(),
+            "yolo_nsfw_model": yolo_model,
+            "yolo_confidence": yolo_conf,
+            "skip_no_person": self.skip_no_person_check.isChecked(),
+        }
+        self.worker_failed = False
+        self.result_csv = None
+        self.set_running(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("AIレシピを作成中...")
+        self.thread = QThread(self)
+        self.worker = PreCreateWorker(self.video_path, csv_path, log_path, options)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.pre_finished)
+        self.worker.failed.connect(self.pre_failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.pre_thread_finished)
+        self.thread.start()
+
+    def set_running(self, running: bool) -> None:
+        self.running = running
+        for widget in (
+            self.pose_combo, self.effect_combo, self.confidence_spin, self.intensity_spin,
+            self.detect_every_spin, self.interpolate_gap_spin, self.no_crotch_check,
+            self.skip_no_person_check, self.all_frames_check, self.start_spin,
+            self.end_spin, self.video_path_input, self.browse_video_button,
+            self.yolo_model_input, self.yolo_confidence_spin, self.start_button,
+        ):
+            widget.setEnabled(not running)
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("キャンセル" if running else "キャンセル")
+        if not running:
+            self.update_frame_enabled()
+
+    def update_progress(self, current: int, total: int, elapsed: float) -> None:
+        self.progress_bar.setMaximum(max(1, total))
+        self.progress_bar.setValue(current)
+        self.progress_label.setText(progress_text(current, total, elapsed))
+
+    def pre_finished(self, csv_path: str) -> None:
+        self.result_csv = Path(csv_path)
+        self.progress_label.setText(f"完了: {csv_path}")
+
+    def pre_failed(self, message: str) -> None:
+        self.worker_failed = True
+        self.set_running(False)
+        if "キャンセル" in message:
+            QMessageBox.information(self, "キャンセル", message)
+            self.progress_label.setText("キャンセル")
+        else:
+            QMessageBox.critical(self, "Error", message)
+            self.progress_label.setText("失敗")
+
+    def pre_thread_finished(self) -> None:
+        self.running = False
+        if self.result_csv is not None and not self.worker_failed:
+            self.accept()
+
+    def cancel_or_reject(self) -> None:
+        if self.running:
+            if self.worker:
+                self.worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.progress_label.setText("キャンセル中...")
+            return
+        self.reject()
+
+    def reject(self) -> None:
+        if self.running:
+            self.cancel_or_reject()
+            return
+        super().reject()
+
+
+class PostProgressDialog(QDialog):
+    def __init__(self, csv_path: Path, output_path: Path, log_path: Path, parent=None) -> None:
+        super().__init__(parent)
+        self.csv_path = csv_path
+        self.output_path = output_path
+        self.log_path = log_path
+        self.thread: QThread | None = None
+        self.worker: PostWorker | None = None
+        self.finished_output: str | None = None
+        self.failed_message: str | None = None
+        self.running = False
+        self.setWindowTitle("エンコード")
+        self.resize(460, 140)
+        layout = QVBoxLayout(self)
+        self.label = QLabel("エンコード準備中...")
+        self.progress_bar = QProgressBar()
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress_bar)
+
+    def start(self) -> None:
+        self.running = True
+        self.thread = QThread(self)
+        self.worker = PostWorker(self.csv_path, self.output_path, self.log_path)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.post_finished)
+        self.worker.failed.connect(self.post_failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.post_thread_finished)
+        self.thread.start()
+
+    def update_progress(self, current: int, total: int, elapsed: float) -> None:
+        self.progress_bar.setMaximum(max(1, total))
+        self.progress_bar.setValue(current)
+        self.label.setText(progress_text(current, total, elapsed))
+
+    def post_finished(self, output_path: str) -> None:
+        self.finished_output = output_path
+
+    def post_failed(self, message: str) -> None:
+        self.failed_message = message
+
+    def post_thread_finished(self) -> None:
+        self.running = False
+        if self.failed_message:
+            QMessageBox.critical(self, "Error", self.failed_message)
+            self.reject()
+            return
+        if self.finished_output:
+            QMessageBox.information(self, "完了", f"エンコードが完了しました。\n{self.finished_output}")
+            self.accept()
+
+    def reject(self) -> None:
+        if self.running:
+            QMessageBox.information(self, "処理中", "エンコード中は閉じられません。")
+            return
+        super().reject()
 
 
 @dataclass
@@ -730,8 +1259,34 @@ class FrameCanvas(QWidget):
 
 
 class EditorWindow(QMainWindow):
-    def __init__(self, csv_path: Path) -> None:
+    def __init__(self, csv_path: Path | None = None) -> None:
         super().__init__()
+        self.csv_path: Path | None = None
+        self.dirty = False
+        self.editor_windows: list[EditorWindow] = []
+        self.cap = None
+        self.setWindowTitle("pre CSV Editor")
+        self.resize(1500, 900)
+        if csv_path is None:
+            self.build_empty_ui()
+        else:
+            self.load_csv(csv_path)
+
+    def build_empty_ui(self) -> None:
+        self.menuBar().clear()
+        self.build_menu()
+        label = QLabel("レシピを開くかレシピ生成を実行してください")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCentralWidget(label)
+
+    def load_csv(self, csv_path: Path) -> None:
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        old_central = self.centralWidget()
+        if old_central is not None:
+            old_central.deleteLater()
+        self.menuBar().clear()
         self.csv_path = csv_path
         self.data = read_pre_csv(csv_path)
         self.original_rows = [dict(row) for row in self.data.rows]
@@ -756,15 +1311,11 @@ class EditorWindow(QMainWindow):
         self.pose_overlay_cache: dict[int, tuple[list[tuple[int, int, int, int]], list[np.ndarray]]] = {}
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
-        self.resize(1500, 900)
         self.build_ui()
         self.load_frame()
 
     def build_ui(self) -> None:
-        save_action = QAction("保存", self)
-        save_action.setShortcut(QKeySequence.StandardKey.Save)
-        save_action.triggered.connect(self.save_with_confirm)
-        self.addAction(save_action)
+        self.build_menu()
 
         prev_frame_action = QAction("前のフレーム", self)
         prev_frame_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
@@ -880,7 +1431,7 @@ class EditorWindow(QMainWindow):
         intensity_layout.addWidget(self.intensity_slider, stretch=1)
         meta_layout.addRow("intensity", intensity_layout)
         meta_layout.addRow("effect", self.effect_combo)
-        for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch"):
+        for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch", "skip_no_person"):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
 
@@ -900,12 +1451,14 @@ class EditorWindow(QMainWindow):
         self.auto_track_status.setWordWrap(True)
         self.create_from_nearest_button = QPushButton("直近枠から作成")
         self.save_button = QPushButton("保存")
+        self.encode_button = QPushButton("エンコード")
         self.restore_frame_button = QPushButton("選択したフレームを元に戻す")
         right_layout.addWidget(QLabel("Type"))
         right_layout.addWidget(self.type_input)
         right_layout.addWidget(self.auto_track_status)
         right_layout.addWidget(self.create_from_nearest_button)
         right_layout.addWidget(self.save_button)
+        right_layout.addWidget(self.encode_button)
         right_layout.addWidget(self.restore_frame_button)
 
         self.mosaic_table = QTableWidget(DEFAULT_VISIBLE_MOSAICS, 14)
@@ -927,6 +1480,7 @@ class EditorWindow(QMainWindow):
         self.go_button.clicked.connect(self.go_to_frame)
         self.sequence_slider.valueChanged.connect(self.select_sequence_frame)
         self.save_button.clicked.connect(self.save_with_confirm)
+        self.encode_button.clicked.connect(self.encode_post)
         self.restore_frame_button.clicked.connect(self.restore_current_frame)
         self.create_from_nearest_button.clicked.connect(self.create_from_nearest)
         self.preview_checkbox.stateChanged.connect(self.refresh_canvas_frame)
@@ -943,6 +1497,66 @@ class EditorWindow(QMainWindow):
         self.frame_table.itemSelectionChanged.connect(self.select_selected_frame_row)
         self.frame_table.itemChanged.connect(self.update_frame_from_table)
         self.populate_frame_table()
+
+    def build_menu(self) -> None:
+        menu = self.menuBar().addMenu("メニュー")
+
+        create_action = QAction("レシピ生成", self)
+        create_action.triggered.connect(self.create_recipe_from_menu)
+        menu.addAction(create_action)
+
+        open_action = QAction("レシピを開く", self)
+        open_action.triggered.connect(self.open_recipe_from_menu)
+        menu.addAction(open_action)
+
+        save_action = QAction("レシピを保存", self)
+        save_action.setShortcut(QKeySequence.StandardKey.Save)
+        save_action.triggered.connect(self.save_with_confirm)
+        save_action.setEnabled(self.csv_path is not None)
+        menu.addAction(save_action)
+
+        encode_action = QAction("エンコード", self)
+        encode_action.triggered.connect(self.encode_post)
+        encode_action.setEnabled(self.csv_path is not None)
+        menu.addAction(encode_action)
+
+    def create_recipe_from_menu(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "動画ファイルを選択",
+            "",
+            "Video (*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv *.MKV);;All files (*)",
+        )
+        if not selected:
+            return
+        dialog = PreCreateDialog(Path(selected))
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_csv is not None:
+            self.open_editor_window(dialog.result_csv)
+
+    def open_recipe_from_menu(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "_pre.csv を選択", "", "CSV (*.csv)")
+        if selected:
+            self.open_editor_window(Path(selected))
+
+    def open_editor_window(self, csv_path: Path) -> None:
+        if self.csv_path is None:
+            try:
+                self.load_csv(csv_path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Error", str(exc))
+            return
+        try:
+            window = EditorWindow(csv_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", str(exc))
+            return
+        self.editor_windows.append(window)
+        window.destroyed.connect(lambda _obj=None, w=window: self.forget_editor_window(w))
+        window.show()
+
+    def forget_editor_window(self, window: "EditorWindow") -> None:
+        if window in self.editor_windows:
+            self.editor_windows.remove(window)
 
     def current_row(self) -> dict[str, str]:
         return self.data.rows[self.current_index]
@@ -1540,6 +2154,9 @@ class EditorWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def save_with_confirm(self, *args) -> None:
+        if self.csv_path is None:
+            QMessageBox.information(self, "未選択", "レシピが開かれていません。")
+            return
         if QMessageBox.question(self, "保存確認", f"{self.csv_path} を上書き保存しますか？") != QMessageBox.StandardButton.Yes:
             return
         write_pre_csv(self.csv_path, self.data)
@@ -1548,33 +2165,68 @@ class EditorWindow(QMainWindow):
         self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
         self.populate_frame_table()
 
+    def save_without_confirm(self) -> None:
+        if self.csv_path is None:
+            return
+        write_pre_csv(self.csv_path, self.data)
+        self.original_rows = [dict(row) for row in self.data.rows]
+        self.dirty = False
+        self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
+        self.populate_frame_table()
+
+    def encode_post(self) -> None:
+        if self.csv_path is None:
+            QMessageBox.information(self, "未選択", "レシピが開かれていません。")
+            return
+        self.save_without_confirm()
+        output_path = post_output_path_from_csv(self.csv_path)
+        log_path = output_path.with_name(f"{output_path.stem}_log.txt")
+        self.encode_button.setEnabled(False)
+        dialog = PostProgressDialog(self.csv_path, output_path, log_path, self)
+        dialog.finished.connect(lambda _result: self.encode_button.setEnabled(True))
+        dialog.start()
+        dialog.exec()
+
     def closeEvent(self, event) -> None:
         if self.dirty:
             result = QMessageBox.question(self, "未保存", "未保存の変更があります。閉じますか？")
             if result != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
         event.accept()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="_pre.csv GUI editor")
-    parser.add_argument("csv", nargs="?", help="編集する _pre.csv")
+    parser.add_argument("input", nargs="?", help="編集する _pre.csv、またはAIレシピを作成する動画")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    csv_path = Path(args.csv) if args.csv else None
-    if csv_path is None:
-        selected, _ = QFileDialog.getOpenFileName(None, "_pre.csv を選択", "", "CSV (*.csv)")
-        if not selected:
-            return
-        csv_path = Path(selected)
-    try:
-        window = EditorWindow(csv_path)
-    except Exception as exc:
-        QMessageBox.critical(None, "Error", str(exc))
+    input_path = Path(args.input) if args.input else None
+    if input_path is None:
+        window = EditorWindow()
+        window.show()
+        sys.exit(app.exec())
+    if not input_path.is_file():
+        QMessageBox.critical(None, "Error", f"ファイルが見つかりません: {input_path}")
         return
+
+    if input_path.suffix.lower() == ".csv":
+        try:
+            window = EditorWindow(input_path)
+        except Exception as exc:
+            QMessageBox.critical(None, "Error", str(exc))
+            return
+    else:
+        window = EditorWindow()
+        window.show()
+        pre_dialog = PreCreateDialog(input_path)
+        if pre_dialog.exec() == QDialog.DialogCode.Accepted and pre_dialog.result_csv is not None:
+            window.open_editor_window(pre_dialog.result_csv)
+        else:
+            window.build_empty_ui()
     window.show()
     sys.exit(app.exec())
 

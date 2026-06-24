@@ -54,6 +54,7 @@ output/
 *.log.txt
 *.tmp
 *.cache
+config.toml
 .DS_Store
 Thumbs.db
 

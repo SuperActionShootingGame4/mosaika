@@ -745,6 +745,8 @@ def process_video(
     csv_path: str | None = None,
     render_debug_to_output: bool = False,
     csv_only: bool = False,
+    progress_callback=None,
+    skip_no_person: bool = False,
 ) -> None:
     def _log(msg: str) -> None:
         if log_file:
@@ -835,6 +837,7 @@ def process_video(
         meta.writerow(["detect_every",    detect_every])
         meta.writerow(["interpolate_gap", max_interpolate_gap])
         meta.writerow(["no_crotch",        int(no_crotch)])
+        meta.writerow(["skip_no_person",   int(skip_no_person)])
         csv_writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header())
         csv_writer.writeheader()
 
@@ -936,38 +939,47 @@ def process_video(
                     if (frame_idx - start_frame) % detect_every == 0:
                         # Step 1: Pose で股間エリアを特定
                         search_boxes, pose_kps = get_crotch_boxes(frame, pose_model_bundle)
-                        # Step 2: NudeNet で全体画像から全検出（0.01以上）を取得
-                        all_nudenet_boxes = detect_genitalia_multicrop(
-                            detector, frame, tmp_frame_path, 0.01
-                        )
-                        yolo_boxes = detect_yolo_genitalia_multicrop(
-                            yolo_nsfw_model, frame, yolo_confidence, yolo_source
-                        )
-                        all_detector_boxes = all_nudenet_boxes + yolo_boxes
-                        # Step 3: confidence 閾値でフィルタしてから crotch フィルタ適用
-                        nudenet_boxes_conf = [
-                            (box, score, label) for box, score, label in all_nudenet_boxes
-                            if score >= confidence
-                        ]
-                        yolo_boxes_conf = [
-                            (box, score, label) for box, score, label in yolo_boxes
-                            if score >= yolo_confidence
-                        ]
-                        nudenet_adopted = [
-                            (box, f"NudeNet {short_label}")
-                            for box, short_label in filter_by_crotch(
-                                nudenet_boxes_conf, search_boxes, enabled=not no_crotch
+                        if skip_no_person and not pose_kps:
+                            all_nudenet_boxes = []
+                            yolo_boxes = []
+                            all_detector_boxes = []
+                            nudenet_boxes_conf = []
+                            yolo_boxes_conf = []
+                            new_boxes = []
+                            _log(f"frame {frame_idx}: no person detected, skipped NudeNet/YOLO")
+                        else:
+                            # Step 2: NudeNet で全体画像から全検出（0.01以上）を取得
+                            all_nudenet_boxes = detect_genitalia_multicrop(
+                                detector, frame, tmp_frame_path, 0.01
                             )
-                        ]
-                        yolo_adopted = [
-                            (box, short_label)
-                            for box, short_label in filter_by_crotch(
-                                yolo_boxes_conf, search_boxes, enabled=not no_crotch
+                            yolo_boxes = detect_yolo_genitalia_multicrop(
+                                yolo_nsfw_model, frame, yolo_confidence, yolo_source
                             )
-                        ]
-                        new_boxes = merge_adopted_boxes(
-                            nudenet_adopted + yolo_adopted
-                        )
+                            all_detector_boxes = all_nudenet_boxes + yolo_boxes
+                            # Step 3: confidence 閾値でフィルタしてから crotch フィルタ適用
+                            nudenet_boxes_conf = [
+                                (box, score, label) for box, score, label in all_nudenet_boxes
+                                if score >= confidence
+                            ]
+                            yolo_boxes_conf = [
+                                (box, score, label) for box, score, label in yolo_boxes
+                                if score >= yolo_confidence
+                            ]
+                            nudenet_adopted = [
+                                (box, f"NudeNet {short_label}")
+                                for box, short_label in filter_by_crotch(
+                                    nudenet_boxes_conf, search_boxes, enabled=not no_crotch
+                                )
+                            ]
+                            yolo_adopted = [
+                                (box, short_label)
+                                for box, short_label in filter_by_crotch(
+                                    yolo_boxes_conf, search_boxes, enabled=not no_crotch
+                                )
+                            ]
+                            new_boxes = merge_adopted_boxes(
+                                nudenet_adopted + yolo_adopted
+                            )
 
                         last_boxes = new_boxes
                         last_search_boxes = search_boxes
@@ -1011,6 +1023,8 @@ def process_video(
 
                     frame_idx += 1
                     pbar.update(1)
+                    if progress_callback:
+                        progress_callback(pbar.n, process_frames, pbar.format_dict.get("elapsed", 0.0))
     finally:
         cap.release()
         if writer:
@@ -1191,6 +1205,7 @@ def process_post_from_csv(
     output_path: str | None,
     log_file=None,
     effect_override: str | None = None,
+    progress_callback=None,
 ) -> None:
     def _log(msg: str) -> None:
         if log_file:
@@ -1254,6 +1269,8 @@ def process_post_from_csv(
                     frame = apply_censor_effect(frame, *box, intensity, effect)
                 writer.write(frame)
                 pbar.update(1)
+                if progress_callback:
+                    progress_callback(pbar.n, len(frame_rows), pbar.format_dict.get("elapsed", 0.0))
     finally:
         cap.release()
         writer.release()
@@ -1324,6 +1341,8 @@ def main() -> None:
                         help="前後フレーム補間を無効化 (デフォルト: 有効)")
     parser.add_argument("--no-crotch", action="store_true",
                         help="股間領域との重なりチェックを無効化し、しきい値以上の性器検出をすべて採用")
+    parser.add_argument("--skip-no-person", action="store_true",
+                        help="Poseで人物が検出されないフレームはNudeNet/YOLO NSFW検出をスキップする")
     parser.add_argument("--yolo-nsfw-model", default=None,
                         help="追加で使うYOLO NSFWモデル(.pt)のパス (デフォルト: 無効)")
     parser.add_argument("--yolo-confidence", type=float, default=None, metavar="F",
@@ -1401,6 +1420,7 @@ def main() -> None:
             log(f"エフェクト     : {effect}", lf)
             log(f"信頼度閾値    : {args.confidence}", lf)
             log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
+            log(f"人物なしスキップ: {'有効' if args.skip_no_person else '無効'}", lf)
             log(f"ポーズモデル  : {args.pose_model}", lf)
             log(f"YOLO NSFW     : {args.yolo_nsfw_model or '無効'}", lf)
             if args.yolo_nsfw_model:
@@ -1473,6 +1493,7 @@ def main() -> None:
                     csv_path=csv_path,
                     render_debug_to_output=False,
                     csv_only=True,
+                    skip_no_person=args.skip_no_person,
                 )
                 log(f"\n完了: {csv_path}", lf)
             except KeyboardInterrupt:
@@ -1498,6 +1519,7 @@ def main() -> None:
         log(f"エフェクト     : {effect}", lf)
         log(f"信頼度閾値    : {args.confidence}", lf)
         log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
+        log(f"人物なしスキップ: {'有効' if args.skip_no_person else '無効'}", lf)
         log(f"ポーズモデル  : {args.pose_model}", lf)
         log(f"YOLO NSFW     : {args.yolo_nsfw_model or '無効'}", lf)
         if args.yolo_nsfw_model:
@@ -1525,6 +1547,7 @@ def main() -> None:
                 frame_range=args.frames,
                 pose_backend=args.pose_model,
                 no_crotch=args.no_crotch,
+                skip_no_person=args.skip_no_person,
             )
             log(f"\n完了: {output_path}", lf)
         except KeyboardInterrupt:
