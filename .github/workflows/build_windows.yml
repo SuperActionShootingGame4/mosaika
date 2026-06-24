@@ -35,9 +35,7 @@ jobs:
           .venv\Scripts\pip install --no-cache-dir "nudenet>=3.4.0"
 
       - name: Verify nudenet is installed
-        run: |
-          .venv\Scripts\pip show nudenet
-          .venv\Scripts\python -c "import nudenet; print('nudenet OK:', nudenet.__version__)"
+        run: .venv\Scripts\python -c "from nudenet import NudeDetector; print('nudenet OK')"
 
       - name: Show installed packages (debug)
         run: .venv\Scripts\pip list
