@@ -50,27 +50,15 @@ jobs:
           Write-Host "640m.onnx: $size bytes"
         shell: pwsh
 
-      - name: Build mosaika-editor (GUI)
-        run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_editor.spec
+      - name: Build mosaika (editor + CLI)
+        run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika.spec
 
-      - name: Build mosaika-cli (CLI)
-        run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_cli.spec
+      - name: Copy NudeNet model to dist
+        run: copy 640m.onnx dist\mosaika\
 
-      - name: Copy NudeNet model to dist folders
-        run: |
-          copy 640m.onnx dist\mosaika-editor\
-          copy 640m.onnx dist\mosaika-cli\
-
-      - name: Upload mosaika-editor
+      - name: Upload mosaika
         uses: actions/upload-artifact@v4
         with:
-          name: mosaika-editor-windows
-          path: dist/mosaika-editor/
-          retention-days: 30
-
-      - name: Upload mosaika-cli
-        uses: actions/upload-artifact@v4
-        with:
-          name: mosaika-cli-windows
-          path: dist/mosaika-cli/
+          name: mosaika-windows
+          path: dist/mosaika/
           retention-days: 30

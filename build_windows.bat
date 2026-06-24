@@ -35,39 +35,29 @@ if not exist "%SCRIPT_DIR%640m.onnx" (
     exit /b 1
 )
 
-echo [1/2] mosaika-editor ^(GUI^) をビルド中...
-"%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_editor.spec"
+echo ビルド中 ^(editor + CLI → dist\mosaika\^)...
+"%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika.spec"
 if errorlevel 1 (
-    echo mosaika-editor のビルドに失敗しました。
+    echo ビルドに失敗しました。
     pause
     exit /b 1
 )
 
 echo.
-echo [2/2] mosaika-cli ^(CLI^) をビルド中...
-"%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_cli.spec"
-if errorlevel 1 (
-    echo mosaika-cli のビルドに失敗しました。
-    pause
-    exit /b 1
-)
-
-echo.
-echo モデルファイルを dist フォルダにコピー中...
-copy "%SCRIPT_DIR%640m.onnx" "%SCRIPT_DIR%dist\mosaika-editor\" > nul
-copy "%SCRIPT_DIR%640m.onnx" "%SCRIPT_DIR%dist\mosaika-cli\" > nul
+echo モデルファイルを dist\mosaika\ にコピー中...
+copy "%SCRIPT_DIR%640m.onnx" "%SCRIPT_DIR%dist\mosaika\" > nul
 
 echo.
 echo === ビルド完了 ===
 echo.
-echo 出力先:
-echo   dist\mosaika-editor\mosaika-editor.exe  ... GUI エディタ
-echo   dist\mosaika-cli\mosaika-cli.exe        ... CLI ツール
+echo 出力先: dist\mosaika\
+echo   mosaika-editor.exe  ... GUI エディタ
+echo   mosaika-cli.exe     ... CLI ツール
 echo.
 echo 注意事項:
-echo   - ffmpeg を PATH に通すか各 dist フォルダ内に ffmpeg.exe を置いてください
+echo   - ffmpeg を PATH に通すか dist\mosaika\ 内に ffmpeg.exe を置いてください
 echo   - YOLO ポーズモデル ^(yolo11l-pose.pt など^) は初回実行時に自動ダウンロードされます
 echo   - config.toml は mosaika-editor.exe と同じフォルダに自動生成されます
-echo   - 640m.onnx は dist フォルダにコピー済みです
+echo   - 640m.onnx は dist\mosaika\ にコピー済みです
 echo.
 pause
