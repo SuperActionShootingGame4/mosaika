@@ -31,11 +31,26 @@ jobs:
           .venv\Scripts\pip install --no-cache-dir pyinstaller
 
       - name: Ensure nudenet is installed
-        run: |
-          .venv\Scripts\pip install --no-cache-dir "nudenet>=3.4.0"
+        run: .venv\Scripts\pip install --no-cache-dir "nudenet>=3.4.0"
 
       - name: Verify nudenet is installed
         run: .venv\Scripts\python -c "from nudenet import NudeDetector; print('nudenet OK')"
+
+      - name: Verify PyQt6 is installed and importable
+        run: |
+          .venv\Scripts\pip show PyQt6
+          .venv\Scripts\python -c "from PyQt6.QtWidgets import QApplication; print('PyQt6 OK')"
+
+      - name: Show collect_all result for PyQt6 (debug)
+        run: >-
+          .venv\Scripts\python -c "
+          from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files;
+          d,b,h = collect_all('PyQt6');
+          print(f'collect_all => datas:{len(d)} binaries:{len(b)} hiddenimports:{len(h)}');
+          print('first 3 datas:', d[:3]);
+          print('first 3 binaries:', b[:3]);
+          print('first 3 hiddenimports:', h[:3])
+          "
 
       - name: Show installed packages (debug)
         run: .venv\Scripts\pip list
@@ -53,17 +68,27 @@ jobs:
       - name: Build mosaika-editor (GUI)
         run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_editor.spec
 
+      - name: Check PyQt6 in built bundle (debug)
+        shell: pwsh
+        run: |
+          $internal = "dist\mosaika-editor\_internal"
+          if (Test-Path "$internal\PyQt6") {
+            Write-Host "OK: _internal\PyQt6\ exists"
+            Get-ChildItem "$internal\PyQt6" | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.Name)" }
+          } else {
+            Write-Host "NG: _internal\PyQt6\ NOT FOUND"
+            Write-Host "Contents of _internal\:"
+            Get-ChildItem $internal | Select-Object -First 20 | ForEach-Object { Write-Host "  $($_.Name)" }
+          }
+
       - name: Build mosaika-cli (CLI)
         run: .venv\Scripts\python -m PyInstaller --noconfirm --clean mosaika_cli.spec
 
       - name: Combine into dist/mosaika/
         shell: pwsh
         run: |
-          # editor ディレクトリを mosaika にリネーム（新名前だけ指定）
           Rename-Item dist\mosaika-editor mosaika
-          # CLI exe だけをコピー（_internal/ は editor のものを共用）
           Copy-Item dist\mosaika-cli\mosaika-cli.exe dist\mosaika\
-          # NudeNet モデルをコピー
           Copy-Item 640m.onnx dist\mosaika\
 
       - name: Upload mosaika
