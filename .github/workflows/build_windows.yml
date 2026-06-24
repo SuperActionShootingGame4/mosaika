@@ -23,20 +23,16 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install dependencies
         run: |
           python -m venv .venv
           .venv\Scripts\pip install --upgrade pip
-          .venv\Scripts\pip install -r requirements.txt
-          .venv\Scripts\pip install pyinstaller
+          .venv\Scripts\pip install --no-cache-dir -r requirements.txt
+          .venv\Scripts\pip install --no-cache-dir pyinstaller
+
+      - name: Ensure nudenet is installed
+        run: |
+          .venv\Scripts\pip install --no-cache-dir "nudenet>=3.4.0"
 
       - name: Verify nudenet is installed
         run: |
