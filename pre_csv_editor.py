@@ -79,6 +79,7 @@ TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
 RECIPE_CONFIG_SECTION = "recipe_generation"
+DISPLAY_SEQUENTIAL_MAX_SKIP = 120
 
 
 class RecipeGenerationCancelled(Exception):
@@ -1457,6 +1458,7 @@ class EditorWindow(QMainWindow):
         self.current_index = 0
         self.selected_slot = 1
         self.dirty = False
+        self.display_cap_pos = None
         self.image_width = 0
         self.image_height = 0
         self.source_frame: np.ndarray | None = None
@@ -1469,6 +1471,7 @@ class EditorWindow(QMainWindow):
         self.pose_overlay_cache: dict[int, tuple[list[tuple[int, int, int, int]], list[np.ndarray]]] = {}
         self.keep_range_start: int | None = None
         self.keep_range_end: int | None = None
+        self.display_cap_pos: int | None = None
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self.playback_next_frame)
         self.playback_index: int | None = None
@@ -1794,9 +1797,8 @@ class EditorWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Error", f"frame_no が不正です: {frame_no_text}")
             return
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        ok, frame = self.cap.read()
-        if not ok:
+        frame = self.read_frame_number(frame_no, prefer_sequential=True)
+        if frame is None:
             QMessageBox.warning(self, "Error", f"フレームを読めません: frame_no={frame_no}")
             return
         self.source_frame = frame
@@ -1813,6 +1815,28 @@ class EditorWindow(QMainWindow):
             self.populate_selected_from_nearest(on=False)
         self.select_current_frame_row()
         self.refresh_mosaic_table()
+
+    def read_frame_number(self, frame_no: int, prefer_sequential: bool) -> np.ndarray | None:
+        if self.cap is None:
+            return None
+        can_read_forward = (
+            prefer_sequential
+            and self.display_cap_pos is not None
+            and frame_no >= self.display_cap_pos
+            and frame_no - self.display_cap_pos <= DISPLAY_SEQUENTIAL_MAX_SKIP
+        )
+        if not can_read_forward:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            self.display_cap_pos = frame_no
+
+        frame = None
+        while self.display_cap_pos is not None and self.display_cap_pos <= frame_no:
+            ok, frame = self.cap.read()
+            if not ok:
+                self.display_cap_pos = None
+                return None
+            self.display_cap_pos += 1
+        return frame
 
     def refresh_canvas_frame(self, *args) -> None:
         if self.source_frame is None:
@@ -1869,6 +1893,7 @@ class EditorWindow(QMainWindow):
             return None
         if self.playback_cap_pos != frame_no:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        self.display_cap_pos = None
         ok, frame = self.cap.read()
         if not ok:
             self.playback_cap_pos = None
@@ -1912,6 +1937,7 @@ class EditorWindow(QMainWindow):
         self.playback_active = True
         self.playback_index = start_index
         self.playback_cap_pos = None
+        self.display_cap_pos = None
         self.preview_play_button.setText("停止")
         fit_button_to_text(self.preview_play_button)
         fps = self.cap.get(cv2.CAP_PROP_FPS) if self.cap is not None else 30
@@ -1926,6 +1952,7 @@ class EditorWindow(QMainWindow):
         self.playback_active = False
         self.playback_index = None
         self.playback_cap_pos = None
+        self.display_cap_pos = None
         self.preview_play_button.setText("仮再生")
         fit_button_to_text(self.preview_play_button)
         self.load_frame()
@@ -2476,9 +2503,7 @@ class EditorWindow(QMainWindow):
             frame_no = int(frame_no_text)
         except ValueError:
             return None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        ok, frame = self.cap.read()
-        return frame if ok else None
+        return self.read_frame_number(frame_no, prefer_sequential=False)
 
     def track_slot_to_index(
         self,
