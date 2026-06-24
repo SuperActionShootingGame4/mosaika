@@ -59,8 +59,8 @@ jobs:
       - name: Combine into dist/mosaika/
         shell: pwsh
         run: |
-          # editor ディレクトリを mosaika にリネーム
-          Rename-Item dist\mosaika-editor dist\mosaika
+          # editor ディレクトリを mosaika にリネーム（新名前だけ指定）
+          Rename-Item dist\mosaika-editor mosaika
           # CLI exe だけをコピー（_internal/ は editor のものを共用）
           Copy-Item dist\mosaika-cli\mosaika-cli.exe dist\mosaika\
           # NudeNet モデルをコピー
