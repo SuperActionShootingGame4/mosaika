@@ -641,6 +641,69 @@ def merge_audio_from_source(
         raise RuntimeError(f"FFmpeg エラー:\n{r.stderr}")
 
 
+def source_has_audio(source_video_path: str) -> bool:
+    if shutil.which("ffprobe") is None:
+        return True
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=index", "-of", "csv=p=0", source_video_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+def encode_video_without_audio(tmp_video_path: str, output_path: str) -> None:
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", tmp_video_path,
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+        "-an",
+        output_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    os.remove(tmp_video_path)
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg エラー:\n{r.stderr}")
+
+
+def merge_audio_ranges_from_source(
+    source_video_path: str,
+    tmp_video_path: str,
+    output_path: str,
+    keep_ranges: list[tuple[int, int]],
+    fps: float,
+) -> None:
+    if not keep_ranges:
+        raise RuntimeError("音声マージ用の残す範囲がありません")
+    if not source_has_audio(source_video_path):
+        encode_video_without_audio(tmp_video_path, output_path)
+        return
+    parts: list[str] = []
+    labels: list[str] = []
+    for idx, (start_frame, end_frame) in enumerate(keep_ranges):
+        start_sec = start_frame / fps
+        end_sec = (end_frame + 1) / fps
+        parts.append(
+            f"[1:a:0]atrim=start={start_sec:.6f}:end={end_sec:.6f},"
+            f"asetpts=PTS-STARTPTS[a{idx}]"
+        )
+        labels.append(f"[a{idx}]")
+    parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[aout]")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", tmp_video_path, "-i", source_video_path,
+        "-filter_complex", ";".join(parts),
+        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+        "-c:a", "aac", "-b:a", "192k",
+        "-map", "0:v:0", "-map", "[aout]", "-shortest",
+        output_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    os.remove(tmp_video_path)
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg エラー:\n{r.stderr}")
+
+
 def mosaic_csv_header() -> list[str]:
     header = ["frame_no", "nsfw_detection_count", "crotch_detected", "comment"]
     for i in range(1, MAX_CSV_MOSAICS + 1):
@@ -724,6 +787,55 @@ def boxes_from_csv_row(row: dict[str, str]) -> list[tuple[int, int, int, int]]:
         if box[2] > box[0] and box[3] > box[1]:
             boxes.append(box)
     return boxes
+
+
+def parse_frame_ranges(text: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            raise ValueError(f"範囲が不正です: {part}")
+        start_text, end_text = part.split("-", 1)
+        start = int(start_text.strip())
+        end = int(end_text.strip())
+        if start < 0 or end < start:
+            raise ValueError(f"範囲が不正です: {part}")
+        ranges.append((start, end))
+    return normalize_frame_ranges(ranges)
+
+
+def normalize_frame_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    sorted_ranges = sorted(ranges)
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted_ranges:
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def frame_in_ranges(frame_no: int, ranges: list[tuple[int, int]]) -> bool:
+    return not ranges or any(start <= frame_no <= end for start, end in ranges)
+
+
+def contiguous_ranges_from_frames(frame_numbers: list[int]) -> list[tuple[int, int]]:
+    if not frame_numbers:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = prev = frame_numbers[0]
+    for frame_no in frame_numbers[1:]:
+        if frame_no == prev + 1:
+            prev = frame_no
+            continue
+        ranges.append((start, prev))
+        start = prev = frame_no
+    ranges.append((start, prev))
+    return ranges
 
 
 def process_video(
@@ -1237,6 +1349,18 @@ def process_post_from_csv(
         frame_rows = sorted(rows, key=lambda row: int(row["frame_no"]))
     except (KeyError, ValueError) as exc:
         raise RuntimeError("CSVの frame_no が不正です") from exc
+    try:
+        keep_ranges = parse_frame_ranges(meta.get("keep_ranges", ""))
+    except ValueError as exc:
+        raise RuntimeError(f"CSVの keep_ranges が不正です: {exc}") from exc
+    frame_rows = [
+        row for row in frame_rows
+        if frame_in_ranges(int(row["frame_no"]), keep_ranges)
+    ]
+    if not frame_rows:
+        raise RuntimeError("keep_ranges に含まれるフレーム行がありません")
+    output_frame_numbers = [int(row["frame_no"]) for row in frame_rows]
+    audio_ranges = contiguous_ranges_from_frames(output_frame_numbers)
 
     dst = output_path or str(post_output_path_from_csv(csv_file_path))
     tmp_video_path = dst + ".tmp_noaudio.mp4"
@@ -1276,7 +1400,10 @@ def process_post_from_csv(
         writer.release()
 
     _log("音声をマージ中...")
-    merge_audio_from_source(source_video, tmp_video_path, dst, first_frame, fps)
+    if keep_ranges:
+        merge_audio_ranges_from_source(source_video, tmp_video_path, dst, audio_ranges, fps)
+    else:
+        merge_audio_from_source(source_video, tmp_video_path, dst, first_frame, fps)
     _log(f"完了: {dst}")
 
 

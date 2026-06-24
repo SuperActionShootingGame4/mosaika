@@ -6,12 +6,16 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
-import tomllib
 import time
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
 
 import cv2
 import numpy as np
@@ -26,6 +30,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,8 +38,10 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QSpinBox,
@@ -51,8 +58,11 @@ from mosaic_censor import (
     POSE_BACKENDS,
     SKELETON_EDGES,
     effective_yolo_confidence,
+    frame_in_ranges,
     get_crotch_boxes,
     load_pose_model,
+    normalize_frame_ranges,
+    parse_frame_ranges,
     post_output_path_from_csv,
     process_post_from_csv,
     process_video,
@@ -86,12 +96,50 @@ def load_recipe_config() -> dict:
     if not CONFIG_PATH.is_file():
         return {}
     try:
-        with open(CONFIG_PATH, "rb") as f:
-            data = tomllib.load(f)
+        if tomllib is not None:
+            with open(CONFIG_PATH, "rb") as f:
+                data = tomllib.load(f)
+        else:
+            data = load_recipe_config_fallback(CONFIG_PATH)
     except Exception:
         return {}
     section = data.get(RECIPE_CONFIG_SECTION, {})
     return section if isinstance(section, dict) else {}
+
+
+def load_recipe_config_fallback(path: Path) -> dict:
+    data: dict[str, dict] = {}
+    section: str | None = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            data.setdefault(section, {})
+            continue
+        if section is None or "=" not in line:
+            continue
+        key, value = [part.strip() for part in line.split("=", 1)]
+        data[section][key] = parse_simple_toml_value(value)
+    return data
+
+
+def parse_simple_toml_value(value: str):
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
 
 
 def toml_value(value) -> str:
@@ -641,6 +689,17 @@ def source_video_path(data: CsvData, csv_path: Path) -> Path:
     return video_path
 
 
+def format_frame_ranges(ranges: list[tuple[int, int]]) -> str:
+    return ",".join(f"{start}-{end}" for start, end in ranges)
+
+
+def fit_button_to_text(button: QPushButton) -> None:
+    width = button.fontMetrics().horizontalAdvance(button.text()) + 28
+    button.setMinimumWidth(width)
+    button.setMaximumWidth(width)
+    button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+
 def is_on(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "t", "on", "yes", "y"}
 
@@ -916,21 +975,33 @@ class SequenceSlider(QSlider):
     def __init__(self, frame_numbers: list[int]) -> None:
         super().__init__(Qt.Orientation.Horizontal)
         self.frame_numbers = frame_numbers
+        self.keep_ranges: list[tuple[int, int]] = []
+        self.keep_start_marker: int | None = None
+        self.keep_end_marker: int | None = None
         self.setMinimumHeight(42)
         self.setStyleSheet(
             """
             QSlider::groove:horizontal {
-                height: 4px;
-                background: #a0a0a0;
+                height: 8px;
+                background: transparent;
             }
             QSlider::handle:horizontal {
                 width: 5px;
-                margin: -8px 0;
+                margin: -7px 0;
                 background: #0068c9;
                 border: 1px solid #004b91;
             }
             """
         )
+
+    def set_keep_ranges(self, keep_ranges: list[tuple[int, int]]) -> None:
+        self.keep_ranges = keep_ranges
+        self.update()
+
+    def set_keep_markers(self, start_frame: int | None, end_frame: int | None) -> None:
+        self.keep_start_marker = start_frame
+        self.keep_end_marker = end_frame
+        self.update()
 
     def tick_index(self, frame_no: int) -> int:
         index = bisect.bisect_left(self.frame_numbers, frame_no)
@@ -941,6 +1012,7 @@ class SequenceSlider(QSlider):
         return index
 
     def paintEvent(self, event) -> None:
+        self.paint_trim_ranges()
         super().paintEvent(event)
         if not self.frame_numbers:
             return
@@ -974,6 +1046,90 @@ class SequenceSlider(QSlider):
             elif x > self.width() - 40:
                 alignment = Qt.AlignmentFlag.AlignRight
             painter.drawText(label_x, 29, 80, 13, alignment, str(frame_no))
+        self.paint_keep_markers(painter, option, handle)
+
+    def paint_trim_ranges(self) -> None:
+        if not self.frame_numbers:
+            return
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderHandle,
+            self,
+        )
+        slider_max = max(1, self.width() - handle.width())
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        y = groove.center().y() - 5
+        height = 10
+        left_offset = handle.width() // 2
+        painter = QPainter(self)
+        painter.setPen(Qt.PenStyle.NoPen)
+        first_index = self.minimum()
+        last_index = self.maximum()
+        if last_index <= first_index:
+            return
+
+        def index_to_x(index: int) -> int:
+            position = QStyle.sliderPositionFromValue(
+                first_index,
+                last_index,
+                max(first_index, min(last_index, index)),
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+            return position + left_offset
+
+        full_left = index_to_x(first_index)
+        full_right = index_to_x(last_index)
+        if self.keep_ranges:
+            painter.setBrush(QColor(230, 70, 70, 110))
+            painter.drawRect(full_left, y, max(1, full_right - full_left), height)
+            painter.setBrush(QColor(60, 130, 240, 120))
+            for start_frame, end_frame in self.keep_ranges:
+                start_index = self.tick_index(start_frame)
+                end_index = self.tick_index(end_frame)
+                left = index_to_x(start_index)
+                right = index_to_x(end_index)
+                painter.drawRect(left, y, max(2, right - left), height)
+        else:
+            painter.setBrush(QColor(60, 130, 240, 100))
+            painter.drawRect(full_left, y, max(1, full_right - full_left), height)
+
+    def paint_keep_markers(self, painter: QPainter, option: QStyleOptionSlider, handle: QRect) -> None:
+        if not self.frame_numbers:
+            return
+        slider_max = max(1, self.width() - handle.width())
+        left_offset = handle.width() // 2
+
+        def marker_x(frame_no: int) -> int:
+            index = self.tick_index(frame_no)
+            position = QStyle.sliderPositionFromValue(
+                self.minimum(),
+                self.maximum(),
+                max(self.minimum(), min(self.maximum(), index)),
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+            return position + left_offset
+
+        for label, frame_no, color in (
+            ("S", self.keep_start_marker, QColor(30, 150, 70)),
+            ("E", self.keep_end_marker, QColor(220, 120, 20)),
+        ):
+            if frame_no is None:
+                continue
+            x = marker_x(frame_no)
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(x, 14, x, 29)
+            painter.setPen(color)
+            painter.drawText(max(0, x - 8), 0, 16, 12, Qt.AlignmentFlag.AlignHCenter, label)
 
     def mousePressEvent(self, event) -> None:
         option = QStyleOptionSlider()
@@ -1266,7 +1422,7 @@ class EditorWindow(QMainWindow):
         self.editor_windows: list[EditorWindow] = []
         self.cap = None
         self.setWindowTitle("pre CSV Editor")
-        self.resize(1500, 900)
+        self.resize(1500, 980)
         if csv_path is None:
             self.build_empty_ui()
         else:
@@ -1309,12 +1465,14 @@ class EditorWindow(QMainWindow):
         self.pose_model_bundle = None
         self.pose_model_error: str | None = None
         self.pose_overlay_cache: dict[int, tuple[list[tuple[int, int, int, int]], list[np.ndarray]]] = {}
+        self.keep_range_start: int | None = None
+        self.keep_range_end: int | None = None
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
-        self.build_ui()
+        self.build_ui(show_load_progress=True)
         self.load_frame()
 
-    def build_ui(self) -> None:
+    def build_ui(self, show_load_progress: bool = False) -> None:
         self.build_menu()
 
         prev_frame_action = QAction("前のフレーム", self)
@@ -1389,21 +1547,61 @@ class EditorWindow(QMainWindow):
         frame_status_layout.addWidget(self.skeleton_overlay_checkbox)
         frame_status_layout.addStretch()
         left_layout.addLayout(frame_status_layout)
+        self.keep_start_button = QPushButton("残す開始")
+        self.keep_end_button = QPushButton("残す終了")
+        self.keep_add_button = QPushButton("残す範囲決定")
+        self.keep_list_button = QPushButton("残す範囲一覧")
+        self.keep_clear_button = QPushButton("残す範囲クリア")
+        for button in (
+            self.keep_start_button,
+            self.keep_end_button,
+            self.keep_add_button,
+            self.keep_list_button,
+            self.keep_clear_button,
+        ):
+            fit_button_to_text(button)
+        trimming_group = QGroupBox("トリミング")
+        trimming_group_layout = QHBoxLayout(trimming_group)
+        trim_layout = QHBoxLayout()
+        trim_layout.addWidget(self.keep_start_button)
+        trim_layout.addWidget(self.keep_end_button)
+        trim_layout.addWidget(self.keep_add_button)
+        trim_layout.addWidget(self.keep_list_button)
+        trim_layout.addWidget(self.keep_clear_button)
+        trim_layout.addStretch()
+        trimming_group_layout.addLayout(trim_layout)
+        left_layout.addWidget(trimming_group)
         frame_numbers = [int(row["frame_no"]) for row in self.data.rows]
         self.sequence_slider = SequenceSlider(frame_numbers)
         self.sequence_slider.setRange(0, max(0, len(self.data.rows) - 1))
+        self.sequence_slider.set_keep_ranges(self.keep_ranges())
         left_layout.addWidget(self.sequence_slider)
 
         nav = QHBoxLayout()
+        self.skip_frame_input = QLineEdit("10")
+        self.skip_frame_input.setPlaceholderText("skip")
+        skip_input_width = self.skip_frame_input.fontMetrics().horizontalAdvance("000000") + 24
+        self.skip_frame_input.setFixedWidth(skip_input_width)
+        self.prev_skip_button = QPushButton("前へスキップ")
         self.prev_button = QPushButton("前へ")
         self.next_button = QPushButton("次へ")
+        self.next_skip_button = QPushButton("次へスキップ")
         self.frame_input = QLineEdit()
         self.frame_input.setPlaceholderText("frame_no")
+        frame_input_width = self.frame_input.fontMetrics().horizontalAdvance("0000000000") + 24
+        self.frame_input.setFixedWidth(frame_input_width)
         self.go_button = QPushButton("移動")
-        for button in (self.prev_button, self.next_button, self.go_button):
-            nav.addWidget(button)
+        nav.addWidget(QLabel("skip frame:"))
+        nav.addWidget(self.skip_frame_input)
+        nav.addWidget(self.prev_skip_button)
+        nav.addWidget(self.prev_button)
+        nav.addWidget(self.next_button)
+        nav.addWidget(self.next_skip_button)
+        nav.addWidget(self.go_button)
         nav.addWidget(QLabel("Frame:"))
         nav.addWidget(self.frame_input)
+        nav.addStretch()
+        left_layout.addLayout(nav)
         splitter.addWidget(left)
 
         right = QWidget()
@@ -1435,9 +1633,9 @@ class EditorWindow(QMainWindow):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
 
-        self.frame_table = QTableWidget(len(self.data.rows), 6)
+        self.frame_table = QTableWidget(len(self.data.rows), 7)
         self.frame_table.setHorizontalHeaderLabels(
-            ["frame_no", "modify", "Persons", "Mosaic", "Crotch", "comment"]
+            ["frame_no", "modify", "Keep", "Persons", "Mosaic", "Crotch", "comment"]
         )
         self.frame_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.frame_table.horizontalHeader().setStretchLastSection(True)
@@ -1452,7 +1650,7 @@ class EditorWindow(QMainWindow):
         self.create_from_nearest_button = QPushButton("直近枠から作成")
         self.save_button = QPushButton("保存")
         self.encode_button = QPushButton("エンコード")
-        self.restore_frame_button = QPushButton("選択したフレームを元に戻す")
+        self.restore_frame_button = QPushButton("選択したフレームを元に戻す(複数可能)")
         right_layout.addWidget(QLabel("Type"))
         right_layout.addWidget(self.type_input)
         right_layout.addWidget(self.auto_track_status)
@@ -1471,18 +1669,24 @@ class EditorWindow(QMainWindow):
         self.mosaic_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.mosaic_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(self.mosaic_table, stretch=1)
-        right_layout.addLayout(nav)
         splitter.addWidget(right)
         splitter.setSizes([1100, 400])
 
         self.prev_button.clicked.connect(self.prev_frame)
         self.next_button.clicked.connect(self.next_frame)
+        self.prev_skip_button.clicked.connect(self.prev_skip_frame)
+        self.next_skip_button.clicked.connect(self.next_skip_frame)
         self.go_button.clicked.connect(self.go_to_frame)
         self.sequence_slider.valueChanged.connect(self.select_sequence_frame)
         self.save_button.clicked.connect(self.save_with_confirm)
         self.encode_button.clicked.connect(self.encode_post)
         self.restore_frame_button.clicked.connect(self.restore_current_frame)
         self.create_from_nearest_button.clicked.connect(self.create_from_nearest)
+        self.keep_start_button.clicked.connect(self.set_keep_range_start)
+        self.keep_end_button.clicked.connect(self.set_keep_range_end)
+        self.keep_add_button.clicked.connect(self.add_current_selection_keep_range)
+        self.keep_list_button.clicked.connect(self.show_keep_ranges)
+        self.keep_clear_button.clicked.connect(self.clear_keep_ranges)
         self.preview_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.crotch_overlay_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.skeleton_overlay_checkbox.stateChanged.connect(self.refresh_canvas_frame)
@@ -1496,7 +1700,10 @@ class EditorWindow(QMainWindow):
         self.frame_table.cellClicked.connect(self.select_frame_row)
         self.frame_table.itemSelectionChanged.connect(self.select_selected_frame_row)
         self.frame_table.itemChanged.connect(self.update_frame_from_table)
-        self.populate_frame_table()
+        self.populate_frame_table(
+            show_progress=show_load_progress,
+            progress_message="レシピファイルを読み込み中...",
+        )
 
     def build_menu(self) -> None:
         menu = self.menuBar().addMenu("メニュー")
@@ -1673,36 +1880,95 @@ class EditorWindow(QMainWindow):
             self.intensity_slider.setMaximum(intensity)
         self.intensity_slider.setValue(intensity)
 
-    def populate_frame_table(self) -> None:
+    def populate_frame_table(
+        self,
+        show_progress: bool = False,
+        progress_message: str = "トリミング範囲を反映中...",
+    ) -> None:
+        keep_ranges = self.keep_ranges()
+        progress = None
+        start_time = time.monotonic()
+        total = len(self.data.rows)
+        if show_progress:
+            progress = QProgressDialog(progress_message, "", 0, max(1, total), self)
+            progress.setWindowTitle("処理中")
+            progress.setCancelButton(None)
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
         self.frame_table.blockSignals(True)
-        for idx, row in enumerate(self.data.rows):
-            self.update_frame_table_row(idx, row)
-        self.frame_table.blockSignals(False)
+        try:
+            for idx, row in enumerate(self.data.rows):
+                self.update_frame_table_row(idx, row, keep_ranges)
+                if progress is not None and (idx % 20 == 0 or idx + 1 == total):
+                    done = idx + 1
+                    elapsed = time.monotonic() - start_time
+                    percent = int(done * 100 / max(1, total))
+                    remaining = elapsed * (total - done) / done if done else 0
+                    progress.setLabelText(
+                        f"{progress_message} {percent}%  残り "
+                        f"{time.strftime('%H:%M:%S', time.gmtime(max(0, remaining)))}"
+                    )
+                    progress.setValue(done)
+                    QApplication.processEvents()
+        finally:
+            self.frame_table.blockSignals(False)
+            if progress is not None:
+                progress.setValue(max(1, total))
 
     def row_modified(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.original_rows):
             return False
         return self.data.rows[idx] != self.original_rows[idx]
 
-    def update_frame_table_row(self, idx: int, row: dict[str, str]) -> None:
+    def keep_ranges(self) -> list[tuple[int, int]]:
+        try:
+            return parse_frame_ranges(self.data.meta_dict.get("keep_ranges", ""))
+        except ValueError:
+            return []
+
+    def frame_is_kept(self, row: dict[str, str], keep_ranges: list[tuple[int, int]] | None = None) -> bool:
+        try:
+            frame_no = int(row.get("frame_no", ""))
+        except ValueError:
+            return True
+        return frame_in_ranges(frame_no, self.keep_ranges() if keep_ranges is None else keep_ranges)
+
+    def set_keep_ranges(self, ranges: list[tuple[int, int]], show_progress: bool = False) -> None:
+        set_meta_value(self.data, "keep_ranges", format_frame_ranges(normalize_frame_ranges(ranges)))
+        self.mark_dirty()
+        self.sequence_slider.set_keep_ranges(self.keep_ranges())
+        self.populate_frame_table(show_progress=show_progress)
+
+    def update_frame_table_row(
+        self,
+        idx: int,
+        row: dict[str, str],
+        keep_ranges: list[tuple[int, int]] | None = None,
+    ) -> None:
         mosaic_count = enabled_mosaic_count(row)
         nsfw_detection_count = row.get("nsfw_detection_count") or "?"
         persons = self.person_count_for_row(row)
+        kept = self.frame_is_kept(row, keep_ranges)
         values = [
             row.get("frame_no", ""),
             "T" if self.row_modified(idx) else "F",
+            "keep" if kept else "cut",
             persons,
             f"{mosaic_count}/{nsfw_detection_count}",
             "yes" if is_on(row.get("crotch_detected")) else "none",
             row.get("comment", ""),
         ]
-        background = QColor(255, 220, 230) if mosaic_count else QColor(232, 232, 232)
+        if not kept:
+            background = QColor(205, 205, 205)
+        else:
+            background = QColor(255, 220, 230) if mosaic_count else QColor(232, 232, 232)
         self.frame_table.blockSignals(True)
         try:
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setBackground(background)
-                if col != 5:
+                if col != 6:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.frame_table.setItem(idx, col, item)
         finally:
@@ -1871,7 +2137,7 @@ class EditorWindow(QMainWindow):
         self.refresh_mosaic_table()
 
     def update_frame_from_table(self, item: QTableWidgetItem) -> None:
-        if item.column() != 5:
+        if item.column() != 6:
             return
         self.data.rows[item.row()]["comment"] = item.text().strip()
         self.mark_dirty()
@@ -1931,6 +2197,58 @@ class EditorWindow(QMainWindow):
         if selected_rect is None:
             self.populate_selected_from_nearest(on=False)
         self.refresh_mosaic_table()
+
+    def current_frame_no(self) -> int | None:
+        try:
+            return int(self.current_row().get("frame_no", ""))
+        except ValueError:
+            return None
+
+    def set_keep_range_start(self) -> None:
+        frame_no = self.current_frame_no()
+        if frame_no is None:
+            QMessageBox.warning(self, "Error", "現在フレーム番号が不正です")
+            return
+        self.keep_range_start = frame_no
+        self.sequence_slider.set_keep_markers(self.keep_range_start, self.keep_range_end)
+        self.auto_track_status.setText(f"残す開始: frame {frame_no}")
+
+    def set_keep_range_end(self) -> None:
+        frame_no = self.current_frame_no()
+        if frame_no is None:
+            QMessageBox.warning(self, "Error", "現在フレーム番号が不正です")
+            return
+        self.keep_range_end = frame_no
+        self.sequence_slider.set_keep_markers(self.keep_range_start, self.keep_range_end)
+        self.auto_track_status.setText(f"残す終了: frame {frame_no}")
+
+    def add_current_selection_keep_range(self) -> None:
+        if self.keep_range_start is None or self.keep_range_end is None:
+            QMessageBox.information(self, "範囲未指定", "残す開始と残す終了を指定してください。")
+            return
+        start = min(self.keep_range_start, self.keep_range_end)
+        end = max(self.keep_range_start, self.keep_range_end)
+        ranges = self.keep_ranges()
+        ranges.append((start, end))
+        self.set_keep_ranges(ranges, show_progress=True)
+        self.auto_track_status.setText(f"残す範囲を追加: {start}-{end}")
+        self.keep_range_start = None
+        self.keep_range_end = None
+        self.sequence_slider.set_keep_markers(None, None)
+
+    def show_keep_ranges(self) -> None:
+        ranges = self.keep_ranges()
+        text = format_frame_ranges(ranges) if ranges else "全フレームを残します。"
+        QMessageBox.information(self, "残す範囲一覧", text)
+
+    def clear_keep_ranges(self) -> None:
+        if QMessageBox.question(self, "確認", "残す範囲をクリアして全フレームを残しますか？") != QMessageBox.StandardButton.Yes:
+            return
+        self.keep_range_start = None
+        self.keep_range_end = None
+        self.sequence_slider.set_keep_markers(None, None)
+        self.set_keep_ranges([])
+        self.auto_track_status.setText("残す範囲をクリアしました")
 
     def update_selected_type(self, *args) -> None:
         self.current_row()[f"mosaic{self.selected_slot}_type"] = self.type_input.text()
@@ -2009,6 +2327,21 @@ class EditorWindow(QMainWindow):
     def next_frame(self, *args) -> None:
         if self.current_index < len(self.data.rows) - 1:
             self.move_to_index(self.current_index + 1)
+
+    def skip_frame_count(self) -> int:
+        try:
+            count = int(self.skip_frame_input.text().strip())
+        except ValueError:
+            count = 10
+        count = max(1, count)
+        self.skip_frame_input.setText(str(count))
+        return count
+
+    def prev_skip_frame(self, *args) -> None:
+        self.move_to_index(max(0, self.current_index - self.skip_frame_count()))
+
+    def next_skip_frame(self, *args) -> None:
+        self.move_to_index(min(len(self.data.rows) - 1, self.current_index + self.skip_frame_count()))
 
     def go_to_frame(self, *args) -> None:
         wanted = self.frame_input.text().strip()
