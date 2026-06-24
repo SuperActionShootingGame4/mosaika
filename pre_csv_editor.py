@@ -1472,6 +1472,7 @@ class EditorWindow(QMainWindow):
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self.playback_next_frame)
         self.playback_index: int | None = None
+        self.playback_cap_pos: int | None = None
         self.playback_active = False
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
@@ -1858,8 +1859,25 @@ class EditorWindow(QMainWindow):
                 apply_preview_effect(result, rect, intensity, effect)
         return result
 
+    def playback_frame_at_index(self, index: int) -> np.ndarray | None:
+        if self.cap is None:
+            return None
+        frame_no_text = self.data.rows[index].get("frame_no", "")
+        try:
+            frame_no = int(frame_no_text)
+        except ValueError:
+            return None
+        if self.playback_cap_pos != frame_no:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        ok, frame = self.cap.read()
+        if not ok:
+            self.playback_cap_pos = None
+            return None
+        self.playback_cap_pos = frame_no + 1
+        return frame
+
     def show_playback_frame(self, index: int) -> bool:
-        frame = self.frame_at_index(index)
+        frame = self.playback_frame_at_index(index)
         if frame is None:
             return False
         row = self.data.rows[index]
@@ -1874,7 +1892,6 @@ class EditorWindow(QMainWindow):
         self.sequence_slider.blockSignals(True)
         self.sequence_slider.setValue(self.current_index)
         self.sequence_slider.blockSignals(False)
-        self.select_current_frame_row()
         return True
 
     def next_kept_index(self, start_index: int) -> int | None:
@@ -1894,6 +1911,7 @@ class EditorWindow(QMainWindow):
             return
         self.playback_active = True
         self.playback_index = start_index
+        self.playback_cap_pos = None
         self.preview_play_button.setText("停止")
         fit_button_to_text(self.preview_play_button)
         fps = self.cap.get(cv2.CAP_PROP_FPS) if self.cap is not None else 30
@@ -1907,6 +1925,7 @@ class EditorWindow(QMainWindow):
         self.playback_timer.stop()
         self.playback_active = False
         self.playback_index = None
+        self.playback_cap_pos = None
         self.preview_play_button.setText("仮再生")
         fit_button_to_text(self.preview_play_button)
         self.load_frame()
