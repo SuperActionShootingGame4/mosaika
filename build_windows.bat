@@ -18,6 +18,9 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
+echo CPU 版 PyTorch をインストール中（CUDA 版は不要で巨大なため）...
+"%PYTHON%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --quiet
+
 "%PYTHON%" -m PyInstaller --version > nul 2>&1
 if errorlevel 1 (
     echo PyInstaller が見つかりません。インストールします...
