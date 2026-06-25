@@ -1,6 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for mosaika-editor (GUI)
-# PyQt6 は PyInstaller に収集させず、ビルド後に venv から _internal/ へ直接コピーする
 
 block_cipher = None
 
@@ -39,7 +38,8 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'tkinter', 'matplotlib', 'IPython', 'jupyter',
+        'tkinter', 'matplotlib', 'IPython', 'jupyter', 'notebook',
+        'pandas', 'tensorflow',
         'torch.cuda', 'torch.distributed', 'torch.testing',
         'torchaudio',
     ],
@@ -60,7 +60,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=True,
     console=False,
     optimize=2,
     disable_windowed_traceback=False,
@@ -76,7 +76,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=False,
+    upx=True,
     upx_exclude=[],
     name='mosaika-editor',
 )
