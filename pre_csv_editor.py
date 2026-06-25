@@ -6,6 +6,11 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import faulthandler
+import logging
+import platform
+import tempfile
+import threading
 import time
 import sys
 from dataclasses import dataclass
@@ -19,7 +24,7 @@ except ImportError:
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal, qInstallMessageHandler
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -77,10 +82,118 @@ MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
 TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
+
+APP_LOGGER = logging.getLogger("pre_csv_editor")
+APP_LOG_FILE_HANDLE = None
+
+
+def _get_app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
+def _get_log_dir() -> Path:
+    return _get_app_base_dir() / "logs"
+
+
+def setup_app_logging() -> Path:
+    global APP_LOG_FILE_HANDLE
+    log_path = None
+    log_error: Exception | None = None
+    for log_dir in (
+        _get_log_dir(),
+        Path.home() / ".mosaika" / "logs",
+        Path(tempfile.gettempdir()) / "mosaika_logs",
+    ):
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            candidate = log_dir / f"pre_csv_editor_{datetime.now().strftime('%Y%m%d')}.log"
+            with open(candidate, "a", encoding="utf-8"):
+                pass
+            log_path = candidate
+            break
+        except OSError as exc:
+            log_error = exc
+    if log_path is None:
+        raise RuntimeError(f"ログファイルを作成できません: {log_error}")
+
+    APP_LOGGER.setLevel(logging.INFO)
+    APP_LOGGER.handlers.clear()
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)s [%(threadName)s] %(message)s",
+        "%Y-%m-%d %H:%M:%S",
+    ))
+    APP_LOGGER.addHandler(handler)
+    APP_LOGGER.propagate = False
+
+    APP_LOG_FILE_HANDLE = open(log_path, "a", encoding="utf-8")
+    faulthandler.enable(file=APP_LOG_FILE_HANDLE, all_threads=True)
+
+    APP_LOGGER.info("アプリ起動: argv=%s", sys.argv)
+    APP_LOGGER.info(
+        "環境情報: python=%s executable=%s platform=%s cwd=%s frozen=%s",
+        sys.version.replace("\n", " "),
+        sys.executable,
+        platform.platform(),
+        Path.cwd(),
+        getattr(sys, "frozen", False),
+    )
+    return log_path
+
+
+def log_user_action(action: str, **details) -> None:
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    APP_LOGGER.info("ユーザー操作: %s%s%s", action, " " if detail_text else "", detail_text)
+
+
+def install_exception_logging() -> None:
+    def excepthook(exc_type, exc_value, exc_traceback) -> None:
+        APP_LOGGER.critical(
+            "未捕捉例外でアプリが終了します",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    def thread_excepthook(args) -> None:
+        APP_LOGGER.critical(
+            "スレッド未捕捉例外: thread=%s",
+            getattr(args.thread, "name", None),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    def qt_message_handler(mode, context, message) -> None:
+        level = logging.WARNING
+        mode_name = getattr(mode, "name", str(mode))
+        if "Critical" in mode_name or "Fatal" in mode_name:
+            level = logging.ERROR
+        file_name = getattr(context, "file", "") or ""
+        line = getattr(context, "line", 0) or 0
+        APP_LOGGER.log(level, "Qtメッセージ: %s %s (%s:%s)", mode_name, message, file_name, line)
+
+    sys.excepthook = excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = thread_excepthook
+    qInstallMessageHandler(qt_message_handler)
+
+
+class LoggingApplication(QApplication):
+    def notify(self, receiver, event):
+        try:
+            return super().notify(receiver, event)
+        except Exception:
+            APP_LOGGER.critical(
+                "Qtイベント処理中の未捕捉例外: receiver=%r event=%r",
+                receiver,
+                event.type() if event is not None else None,
+                exc_info=True,
+            )
+            raise
+
+
 def _get_config_path() -> Path:
-    if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent / "config.toml"
-    return Path(__file__).resolve().parent / "config.toml"
+    return _get_app_base_dir() / "config.toml"
 
 CONFIG_PATH = _get_config_path()
 RECIPE_CONFIG_SECTION = "recipe_generation"
@@ -108,6 +221,7 @@ def load_recipe_config() -> dict:
         else:
             data = load_recipe_config_fallback(CONFIG_PATH)
     except Exception:
+        APP_LOGGER.warning("設定ファイルを読み込めません: %s", CONFIG_PATH, exc_info=True)
         return {}
     section = data.get(RECIPE_CONFIG_SECTION, {})
     return section if isinstance(section, dict) else {}
@@ -226,6 +340,13 @@ class PreCreateWorker(QObject):
 
     def run(self) -> None:
         try:
+            APP_LOGGER.info(
+                "レシピ生成開始: video=%s csv=%s log=%s options=%s",
+                self.video_path,
+                self.csv_path,
+                self.log_path,
+                self.options,
+            )
             with open(self.log_path, "w", encoding="utf-8") as lf:
                 yolo_confidence = effective_yolo_confidence(
                     self.options["yolo_nsfw_model"],
@@ -253,11 +374,14 @@ class PreCreateWorker(QObject):
                     progress_callback=self.emit_progress,
                     skip_no_person=self.options["skip_no_person"],
                 )
+            APP_LOGGER.info("レシピ生成完了: csv=%s", self.csv_path)
             self.finished.emit(str(self.csv_path))
         except RecipeGenerationCancelled:
+            APP_LOGGER.info("レシピ生成キャンセル: csv=%s", self.csv_path)
             self.csv_path.unlink(missing_ok=True)
             self.failed.emit("レシピ生成をキャンセルしました。")
         except Exception as exc:
+            APP_LOGGER.exception("レシピ生成エラー: video=%s csv=%s", self.video_path, self.csv_path)
             self.failed.emit(str(exc))
 
 
@@ -274,6 +398,12 @@ class PostWorker(QObject):
 
     def run(self) -> None:
         try:
+            APP_LOGGER.info(
+                "エンコード開始: csv=%s output=%s log=%s",
+                self.csv_path,
+                self.output_path,
+                self.log_path,
+            )
             with open(self.log_path, "w", encoding="utf-8") as lf:
                 process_post_from_csv(
                     csv_path=str(self.csv_path),
@@ -281,8 +411,10 @@ class PostWorker(QObject):
                     log_file=lf,
                     progress_callback=self.progress.emit,
                 )
+            APP_LOGGER.info("エンコード完了: output=%s", self.output_path)
             self.finished.emit(str(self.output_path))
         except Exception as exc:
+            APP_LOGGER.exception("エンコードエラー: csv=%s output=%s", self.csv_path, self.output_path)
             self.failed.emit(str(exc))
 
 
@@ -299,12 +431,14 @@ class PreCreateDialog(QDialog):
         self.setWindowTitle("レシピ生成ウィンドウ")
         self.resize(520, 360)
         self.total_frames = self.detect_total_frames()
+        APP_LOGGER.info("レシピ生成ダイアログ表示: video=%s total_frames=%s", self.video_path, self.total_frames)
         self.build_ui()
 
     def detect_total_frames(self) -> int:
         cap = cv2.VideoCapture(str(self.video_path))
         try:
             if not cap.isOpened():
+                APP_LOGGER.warning("動画を開けないため総フレーム数を取得できません: %s", self.video_path)
                 return 0
             return max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
         finally:
@@ -410,11 +544,14 @@ class PreCreateDialog(QDialog):
         self.end_spin.setEnabled(enabled)
 
     def select_yolo_model(self) -> None:
+        log_user_action("YOLO NSFWモデル参照")
         selected, _ = QFileDialog.getOpenFileName(self, "YOLO NSFWモデルを選択", "", "Model (*.pt);;All files (*)")
         if selected:
             self.yolo_model_input.setText(selected)
+            log_user_action("YOLO NSFWモデル選択", path=selected)
 
     def select_video(self) -> None:
+        log_user_action("動画ファイル参照")
         selected, _ = QFileDialog.getOpenFileName(
             self,
             "動画ファイルを選択",
@@ -430,11 +567,13 @@ class PreCreateDialog(QDialog):
         if video_path == self.video_path:
             return True
         if not video_path.is_file():
+            APP_LOGGER.warning("動画ファイルが見つかりません: %s", video_path)
             QMessageBox.warning(self, "Error", f"動画ファイルが見つかりません: {video_path}")
             self.video_path_input.setText(str(self.video_path))
             return False
         self.video_path = video_path
         self.total_frames = self.detect_total_frames()
+        log_user_action("動画ファイル変更", path=video_path, total_frames=self.total_frames)
         max_frame = max(0, self.total_frames - 1)
         for spin in (self.start_spin, self.end_spin):
             spin.setMaximum(max_frame)
@@ -481,9 +620,17 @@ class PreCreateDialog(QDialog):
             return
         frame_range = self.frame_range()
         if frame_range is not None and frame_range[1] < frame_range[0]:
+            APP_LOGGER.warning("フレーム範囲が不正です: range=%s", frame_range)
             QMessageBox.warning(self, "Error", "フレーム範囲が不正です")
             return
-        save_recipe_config(self.current_settings())
+        settings = self.current_settings()
+        log_user_action("レシピ生成開始", **settings)
+        try:
+            save_recipe_config(settings)
+        except Exception:
+            APP_LOGGER.exception("設定ファイルを書き込めません: %s", CONFIG_PATH)
+            QMessageBox.critical(self, "Error", f"設定ファイルを書き込めません: {CONFIG_PATH}")
+            return
         csv_path, log_path = self.output_paths()
         yolo_model = self.yolo_model_input.text().strip() or None
         yolo_conf = None if self.yolo_confidence_spin.value() <= 0 else self.yolo_confidence_spin.value()
@@ -541,14 +688,17 @@ class PreCreateDialog(QDialog):
     def pre_finished(self, csv_path: str) -> None:
         self.result_csv = Path(csv_path)
         self.progress_label.setText(f"完了: {csv_path}")
+        log_user_action("レシピ生成完了", csv_path=csv_path)
 
     def pre_failed(self, message: str) -> None:
         self.worker_failed = True
         self.set_running(False)
         if "キャンセル" in message:
+            APP_LOGGER.info("レシピ生成キャンセル表示: %s", message)
             QMessageBox.information(self, "キャンセル", message)
             self.progress_label.setText("キャンセル")
         else:
+            APP_LOGGER.error("レシピ生成失敗表示: %s", message)
             QMessageBox.critical(self, "Error", message)
             self.progress_label.setText("失敗")
 
@@ -559,11 +709,13 @@ class PreCreateDialog(QDialog):
 
     def cancel_or_reject(self) -> None:
         if self.running:
+            log_user_action("レシピ生成キャンセル要求")
             if self.worker:
                 self.worker.cancel()
             self.cancel_button.setEnabled(False)
             self.progress_label.setText("キャンセル中...")
             return
+        log_user_action("レシピ生成ダイアログを閉じる")
         self.reject()
 
     def reject(self) -> None:
@@ -594,6 +746,7 @@ class PostProgressDialog(QDialog):
 
     def start(self) -> None:
         self.running = True
+        log_user_action("エンコードダイアログ開始", csv_path=self.csv_path, output_path=self.output_path)
         self.thread = QThread(self)
         self.worker = PostWorker(self.csv_path, self.output_path, self.log_path)
         self.worker.moveToThread(self.thread)
@@ -621,15 +774,18 @@ class PostProgressDialog(QDialog):
     def post_thread_finished(self) -> None:
         self.running = False
         if self.failed_message:
+            APP_LOGGER.error("エンコード失敗表示: %s", self.failed_message)
             QMessageBox.critical(self, "Error", self.failed_message)
             self.reject()
             return
         if self.finished_output:
+            log_user_action("エンコード完了", output_path=self.finished_output)
             QMessageBox.information(self, "完了", f"エンコードが完了しました。\n{self.finished_output}")
             self.accept()
 
     def reject(self) -> None:
         if self.running:
+            APP_LOGGER.warning("エンコード中に閉じる操作が行われました")
             QMessageBox.information(self, "処理中", "エンコード中は閉じられません。")
             return
         super().reject()
@@ -1338,6 +1494,7 @@ class FrameCanvas(QWidget):
             self.parent_window.mark_dirty()
             self.parent_window.refresh_mosaic_table()
             self.update()
+            log_user_action("モザイク枠作成開始", frame=self.parent_window.current_frame_no(), slot=slot, x=img_pos.x(), y=img_pos.y())
             return
 
         if event.button() != Qt.MouseButton.LeftButton:
@@ -1395,8 +1552,23 @@ class FrameCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event) -> None:
+        released_mode = self.drag_mode
+        released_slot = self.parent_window.selected_slot
         if self.drag_mode == "pan":
             self.unsetCursor()
+        elif self.drag_mode:
+            rect = get_rect(self.parent_window.current_row(), released_slot)
+            if rect is not None:
+                log_user_action(
+                    "モザイク枠編集完了",
+                    frame=self.parent_window.current_frame_no(),
+                    slot=released_slot,
+                    mode=released_mode,
+                    x1=rect.left(),
+                    y1=rect.top(),
+                    x2=rect.right() + 1,
+                    y2=rect.bottom() + 1,
+                )
         self.drag_mode = None
 
     def wheelEvent(self, event) -> None:
@@ -1417,12 +1589,14 @@ class FrameCanvas(QWidget):
         if vertical_bar is not None:
             vertical_bar.setValue(round(vertical_bar.maximum() * vertical_ratio))
         self.parent_window.update_zoom_label(self.zoom_factor)
+        log_user_action("表示ズーム変更", zoom=round(self.zoom_factor, 3))
         event.accept()
 
 
 class EditorWindow(QMainWindow):
     def __init__(self, csv_path: Path | None = None) -> None:
         super().__init__()
+        APP_LOGGER.info("編集ウィンドウ初期化: csv_path=%s", csv_path)
         self.csv_path: Path | None = None
         self.dirty = False
         self.editor_windows: list[EditorWindow] = []
@@ -1442,6 +1616,7 @@ class EditorWindow(QMainWindow):
         self.setCentralWidget(label)
 
     def load_csv(self, csv_path: Path) -> None:
+        APP_LOGGER.info("CSV読込開始: %s", csv_path)
         if hasattr(self, "playback_active") and self.playback_active:
             self.stop_preview_playback()
         if self.cap is not None:
@@ -1456,9 +1631,11 @@ class EditorWindow(QMainWindow):
         self.original_rows = [dict(row) for row in self.data.rows]
         self.video_path = source_video_path(self.data, self.csv_path)
         if not self.video_path.is_file():
+            APP_LOGGER.error("元動画が見つかりません: csv=%s video=%s", self.csv_path, self.video_path)
             raise RuntimeError(f"元動画が見つかりません: {self.video_path}")
         self.cap = cv2.VideoCapture(str(self.video_path))
         if not self.cap.isOpened():
+            APP_LOGGER.error("動画を開けません: csv=%s video=%s", self.csv_path, self.video_path)
             raise RuntimeError(f"動画を開けません: {self.video_path}")
         self.current_index = 0
         self.selected_slot = 1
@@ -1486,6 +1663,7 @@ class EditorWindow(QMainWindow):
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
         self.build_ui(show_load_progress=True)
         self.load_frame()
+        APP_LOGGER.info("CSV読込完了: csv=%s rows=%s video=%s", csv_path, len(self.data.rows), self.video_path)
 
     def build_ui(self, show_load_progress: bool = False) -> None:
         self.build_menu()
@@ -1747,6 +1925,7 @@ class EditorWindow(QMainWindow):
         menu.addAction(encode_action)
 
     def create_recipe_from_menu(self) -> None:
+        log_user_action("メニュー レシピ生成")
         selected, _ = QFileDialog.getOpenFileName(
             self,
             "動画ファイルを選択",
@@ -1754,26 +1933,33 @@ class EditorWindow(QMainWindow):
             "Video (*.mp4 *.MP4 *.mov *.MOV *.avi *.AVI *.mkv *.MKV);;All files (*)",
         )
         if not selected:
+            log_user_action("レシピ生成 動画選択キャンセル")
             return
+        log_user_action("レシピ生成 動画選択", path=selected)
         dialog = PreCreateDialog(Path(selected))
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_csv is not None:
             self.open_editor_window(dialog.result_csv)
 
     def open_recipe_from_menu(self) -> None:
+        log_user_action("メニュー レシピを開く")
         selected, _ = QFileDialog.getOpenFileName(self, "_pre.csv を選択", "", "CSV (*.csv)")
         if selected:
+            log_user_action("レシピ選択", path=selected)
             self.open_editor_window(Path(selected))
 
     def open_editor_window(self, csv_path: Path) -> None:
+        log_user_action("レシピを開く", csv_path=csv_path)
         if self.csv_path is None:
             try:
                 self.load_csv(csv_path)
             except Exception as exc:
+                APP_LOGGER.exception("レシピを開けません: %s", csv_path)
                 QMessageBox.critical(self, "Error", str(exc))
             return
         try:
             window = EditorWindow(csv_path)
         except Exception as exc:
+            APP_LOGGER.exception("別ウィンドウでレシピを開けません: %s", csv_path)
             QMessageBox.critical(self, "Error", str(exc))
             return
         self.editor_windows.append(window)
@@ -1800,10 +1986,12 @@ class EditorWindow(QMainWindow):
         try:
             frame_no = int(frame_no_text)
         except ValueError:
+            APP_LOGGER.warning("frame_no が不正です: index=%s value=%s", self.current_index, frame_no_text)
             QMessageBox.warning(self, "Error", f"frame_no が不正です: {frame_no_text}")
             return
         frame = self.read_frame_number(frame_no, prefer_sequential=True)
         if frame is None:
+            APP_LOGGER.warning("フレームを読めません: frame_no=%s video=%s", frame_no, self.video_path)
             QMessageBox.warning(self, "Error", f"フレームを読めません: frame_no={frame_no}")
             return
         self.source_frame = frame
@@ -1933,12 +2121,15 @@ class EditorWindow(QMainWindow):
 
     def toggle_preview_playback(self) -> None:
         if self.playback_active:
+            log_user_action("仮再生停止", frame=self.current_frame_no())
             self.stop_preview_playback()
             return
         start_index = self.next_kept_index(self.current_index)
         if start_index is None:
+            APP_LOGGER.info("仮再生不可: 再生できる残す範囲がありません")
             QMessageBox.information(self, "仮再生", "再生できる残す範囲がありません。")
             return
+        log_user_action("仮再生開始", frame=self.data.rows[start_index].get("frame_no", ""))
         self.playback_active = True
         self.playback_index = start_index
         self.playback_cap_pos = None
@@ -1993,6 +2184,7 @@ class EditorWindow(QMainWindow):
         except Exception as exc:
             self.pose_model_error = str(exc)
             self.auto_track_status.setText(f"Pose overlay error: {exc}")
+            APP_LOGGER.exception("Pose overlay error: frame=%s", frame_no)
             return None
         self.pose_overlay_cache[frame_no] = overlay
         self.update_frame_table_row(self.current_index, self.current_row())
@@ -2009,12 +2201,14 @@ class EditorWindow(QMainWindow):
         except Exception as exc:
             self.pose_model_error = str(exc)
             self.auto_track_status.setText(f"Pose model load error: {exc}")
+            APP_LOGGER.exception("Pose model load error: backend=%s", backend)
             return None
         return self.pose_model_bundle
 
     def update_preview_meta(self, *args) -> None:
         set_meta_value(self.data, "effect", self.effect_combo.currentText())
         set_meta_value(self.data, "intensity", str(self.intensity_spin.value()))
+        log_user_action("プレビュー設定変更", effect=self.effect_combo.currentText(), intensity=self.intensity_spin.value())
         self.mark_dirty()
         self.refresh_canvas_frame()
 
@@ -2078,7 +2272,9 @@ class EditorWindow(QMainWindow):
         return frame_in_ranges(frame_no, self.keep_ranges() if keep_ranges is None else keep_ranges)
 
     def set_keep_ranges(self, ranges: list[tuple[int, int]], show_progress: bool = False) -> None:
-        set_meta_value(self.data, "keep_ranges", format_frame_ranges(normalize_frame_ranges(ranges)))
+        normalized = normalize_frame_ranges(ranges)
+        set_meta_value(self.data, "keep_ranges", format_frame_ranges(normalized))
+        log_user_action("残す範囲更新", ranges=format_frame_ranges(normalized) or "all")
         self.mark_dirty()
         self.sequence_slider.set_keep_ranges(self.keep_ranges())
         self.populate_frame_table(show_progress=show_progress)
@@ -2223,11 +2419,13 @@ class EditorWindow(QMainWindow):
                 self.trace_slots.add(slot)
                 self.selected_slot = slot
                 self.refresh_mosaic_table()
+                log_user_action("追跡開始", frame=self.current_frame_no(), slot=slot, source="table")
                 self.trace_slot_range(slot)
             else:
                 self.trace_slots.discard(slot)
                 self.auto_track_anchors.pop(slot, None)
                 self.selected_slot = slot
+                log_user_action("追跡解除", frame=self.current_frame_no(), slot=slot, source="table")
                 self.refresh_mosaic_table()
             return
         if col == 2:
@@ -2236,6 +2434,7 @@ class EditorWindow(QMainWindow):
             else:
                 self.trace_scale_slots.discard(slot)
             self.selected_slot = slot
+            log_user_action("追跡スケール設定変更", frame=self.current_frame_no(), slot=slot, enabled=slot in self.trace_scale_slots)
             self.refresh_mosaic_table()
             return
         if col in (3, 4):
@@ -2251,6 +2450,7 @@ class EditorWindow(QMainWindow):
             else:
                 self.trace_ranges[slot] = (current_start, value)
             self.selected_slot = slot
+            log_user_action("追跡範囲変更", frame=self.current_frame_no(), slot=slot, start=self.trace_ranges[slot][0], end=self.trace_ranges[slot][1])
             self.refresh_mosaic_table()
             return
         keys = {
@@ -2263,6 +2463,7 @@ class EditorWindow(QMainWindow):
         }
         if col == 13:
             self.current_row()["comment"] = item.text().strip()
+            log_user_action("モザイクコメント変更", frame=self.current_frame_no(), slot=slot)
             self.mark_dirty()
             self.update_frame_table_row(self.current_index, self.current_row())
             self.refresh_mosaic_table()
@@ -2277,12 +2478,14 @@ class EditorWindow(QMainWindow):
             set_blank_crotch(self.current_row(), slot)
         self.mark_dirty()
         self.selected_slot = slot
+        log_user_action("モザイク表編集", frame=self.current_frame_no(), slot=slot, key=key, value=value)
         self.refresh_mosaic_table()
 
     def update_frame_from_table(self, item: QTableWidgetItem) -> None:
         if item.column() != 6:
             return
         self.data.rows[item.row()]["comment"] = item.text().strip()
+        log_user_action("フレームコメント変更", row=item.row(), frame=self.data.rows[item.row()].get("frame_no", ""))
         self.mark_dirty()
         self.update_frame_table_row(item.row(), self.data.rows[item.row()])
 
@@ -2317,15 +2520,18 @@ class EditorWindow(QMainWindow):
             if on and get_rect(self.current_row(), self.selected_slot) is None:
                 self.populate_selected_from_nearest(on=True)
             self.mark_dirty()
+            log_user_action("モザイク有効切替", frame=self.current_frame_no(), slot=self.selected_slot, enabled=on)
             self.refresh_mosaic_table()
             return
         if col == 1:
             if self.selected_slot in self.trace_slots:
                 self.trace_slots.discard(self.selected_slot)
                 self.auto_track_anchors.pop(self.selected_slot, None)
+                log_user_action("追跡解除", frame=self.current_frame_no(), slot=self.selected_slot, source="click")
                 self.refresh_mosaic_table()
             else:
                 self.trace_slots.add(self.selected_slot)
+                log_user_action("追跡開始", frame=self.current_frame_no(), slot=self.selected_slot, source="click")
                 self.refresh_mosaic_table()
                 self.trace_slot_range(self.selected_slot)
             return
@@ -2334,6 +2540,7 @@ class EditorWindow(QMainWindow):
                 self.trace_scale_slots.discard(self.selected_slot)
             else:
                 self.trace_scale_slots.add(self.selected_slot)
+            log_user_action("追跡スケール設定変更", frame=self.current_frame_no(), slot=self.selected_slot, enabled=self.selected_slot in self.trace_scale_slots)
             self.refresh_mosaic_table()
             return
         selected_rect = get_rect(self.current_row(), self.selected_slot)
@@ -2350,29 +2557,35 @@ class EditorWindow(QMainWindow):
     def set_keep_range_start(self) -> None:
         frame_no = self.current_frame_no()
         if frame_no is None:
+            APP_LOGGER.warning("残す開始を設定できません: 現在フレーム番号が不正")
             QMessageBox.warning(self, "Error", "現在フレーム番号が不正です")
             return
         self.keep_range_start = frame_no
+        log_user_action("残す開始設定", frame=frame_no)
         self.sequence_slider.set_keep_markers(self.keep_range_start, self.keep_range_end)
         self.auto_track_status.setText(f"残す開始: frame {frame_no}")
 
     def set_keep_range_end(self) -> None:
         frame_no = self.current_frame_no()
         if frame_no is None:
+            APP_LOGGER.warning("残す終了を設定できません: 現在フレーム番号が不正")
             QMessageBox.warning(self, "Error", "現在フレーム番号が不正です")
             return
         self.keep_range_end = frame_no
+        log_user_action("残す終了設定", frame=frame_no)
         self.sequence_slider.set_keep_markers(self.keep_range_start, self.keep_range_end)
         self.auto_track_status.setText(f"残す終了: frame {frame_no}")
 
     def add_current_selection_keep_range(self) -> None:
         if self.keep_range_start is None or self.keep_range_end is None:
+            APP_LOGGER.info("残す範囲追加失敗: 開始または終了が未指定")
             QMessageBox.information(self, "範囲未指定", "残す開始と残す終了を指定してください。")
             return
         start = min(self.keep_range_start, self.keep_range_end)
         end = max(self.keep_range_start, self.keep_range_end)
         ranges = self.keep_ranges()
         ranges.append((start, end))
+        log_user_action("残す範囲追加", start=start, end=end)
         self.set_keep_ranges(ranges, show_progress=True)
         self.auto_track_status.setText(f"残す範囲を追加: {start}-{end}")
         self.keep_range_start = None
@@ -2386,21 +2599,25 @@ class EditorWindow(QMainWindow):
 
     def clear_keep_ranges(self) -> None:
         if QMessageBox.question(self, "確認", "残す範囲をクリアして全フレームを残しますか？") != QMessageBox.StandardButton.Yes:
+            log_user_action("残す範囲クリア キャンセル")
             return
         self.keep_range_start = None
         self.keep_range_end = None
         self.sequence_slider.set_keep_markers(None, None)
         self.set_keep_ranges([])
+        log_user_action("残す範囲クリア")
         self.auto_track_status.setText("残す範囲をクリアしました")
 
     def update_selected_type(self, *args) -> None:
         self.current_row()[f"mosaic{self.selected_slot}_type"] = self.type_input.text()
+        log_user_action("選択モザイクtype変更", frame=self.current_frame_no(), slot=self.selected_slot, value=self.type_input.text())
         self.mark_dirty()
         self.refresh_mosaic_table()
 
     def disable_selected(self, *args) -> None:
         self.current_row()[f"mosaic{self.selected_slot}_on"] = "0"
         set_blank_crotch(self.current_row(), self.selected_slot)
+        log_user_action("選択モザイク削除", frame=self.current_frame_no(), slot=self.selected_slot)
         self.mark_dirty()
         self.refresh_mosaic_table()
 
@@ -2408,6 +2625,7 @@ class EditorWindow(QMainWindow):
         rows = sorted({index.row() for index in self.frame_table.selectedIndexes()})
         if not rows:
             rows = [self.current_index]
+        log_user_action("フレーム復元", rows=rows)
         for row_index in rows:
             if 0 <= row_index < len(self.original_rows):
                 self.data.rows[row_index] = dict(self.original_rows[row_index])
@@ -2432,6 +2650,7 @@ class EditorWindow(QMainWindow):
 
     def create_from_nearest(self, *args) -> None:
         if self.populate_selected_from_nearest(on=True):
+            log_user_action("直近枠から作成", frame=self.current_frame_no(), slot=self.selected_slot)
             self.mark_dirty()
             self.refresh_mosaic_table()
 
@@ -2488,10 +2707,12 @@ class EditorWindow(QMainWindow):
 
     def go_to_frame(self, *args) -> None:
         wanted = self.frame_input.text().strip()
+        log_user_action("フレーム番号移動", frame=wanted)
         for idx, row in enumerate(self.data.rows):
             if row.get("frame_no") == wanted:
                 self.move_to_index(idx)
                 return
+        APP_LOGGER.info("指定frame_noがCSVにありません: %s", wanted)
         QMessageBox.information(self, "Not found", f"frame_no={wanted} はCSVにありません")
 
     def move_to_index(self, target_index: int) -> None:
@@ -2566,20 +2787,24 @@ class EditorWindow(QMainWindow):
 
     def trace_slot_range(self, slot: int) -> None:
         start_frame, end_frame = self.trace_range_for_slot(slot)
+        log_user_action("範囲追跡開始", slot=slot, start=start_frame, end=end_frame)
         start_index = self.frame_index_for_no(start_frame)
         end_index = self.frame_index_for_no(end_frame)
         if start_index is None or end_index is None:
+            APP_LOGGER.warning("範囲追跡失敗: Start/End frame_no がCSVにありません slot=%s start=%s end=%s", slot, start_frame, end_frame)
             self.trace_slots.discard(slot)
             self.auto_track_status.setText(f"mosaic{slot}: Start/End frame_no がCSVにありません")
             self.refresh_mosaic_table()
             return
         if end_index <= start_index:
+            APP_LOGGER.warning("範囲追跡失敗: End が Start 以前 slot=%s start=%s end=%s", slot, start_frame, end_frame)
             self.trace_slots.discard(slot)
             self.auto_track_status.setText(f"mosaic{slot}: End は Start より後の frame_no を指定してください")
             self.refresh_mosaic_table()
             return
         start_rect = get_rect(self.data.rows[start_index], slot)
         if start_rect is None or not is_on(self.data.rows[start_index].get(f"mosaic{slot}_on")):
+            APP_LOGGER.warning("範囲追跡失敗: Start frame に枠がありません slot=%s start=%s", slot, start_frame)
             self.trace_slots.discard(slot)
             self.auto_track_status.setText(f"mosaic{slot}: Start frame に枠がありません")
             self.refresh_mosaic_table()
@@ -2601,6 +2826,7 @@ class EditorWindow(QMainWindow):
             )
             if not success:
                 stop_message = message
+                APP_LOGGER.warning("範囲追跡停止: slot=%s message=%s", slot, message)
                 break
             success_count += 1
             if success_count % 10 == 0:
@@ -2612,6 +2838,7 @@ class EditorWindow(QMainWindow):
         self.trace_slots.discard(slot)
         self.auto_track_anchors.pop(slot, None)
         self.auto_track_status.setText(f"{stop_message} / 更新 {success_count} frame")
+        log_user_action("範囲追跡終了", slot=slot, updated_frames=success_count, message=stop_message)
         self.current_index = original_index
         self.load_frame()
 
@@ -2631,11 +2858,19 @@ class EditorWindow(QMainWindow):
 
     def save_with_confirm(self, *args) -> None:
         if self.csv_path is None:
+            APP_LOGGER.info("保存不可: レシピ未選択")
             QMessageBox.information(self, "未選択", "レシピが開かれていません。")
             return
         if QMessageBox.question(self, "保存確認", f"{self.csv_path} を上書き保存しますか？") != QMessageBox.StandardButton.Yes:
+            log_user_action("保存キャンセル", csv_path=self.csv_path)
             return
-        write_pre_csv(self.csv_path, self.data)
+        log_user_action("保存", csv_path=self.csv_path)
+        try:
+            write_pre_csv(self.csv_path, self.data)
+        except Exception as exc:
+            APP_LOGGER.exception("保存失敗: csv=%s", self.csv_path)
+            QMessageBox.critical(self, "Error", f"保存に失敗しました: {exc}")
+            return
         self.original_rows = [dict(row) for row in self.data.rows]
         self.dirty = False
         self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
@@ -2644,7 +2879,12 @@ class EditorWindow(QMainWindow):
     def save_without_confirm(self) -> None:
         if self.csv_path is None:
             return
-        write_pre_csv(self.csv_path, self.data)
+        APP_LOGGER.info("確認なし保存: csv=%s", self.csv_path)
+        try:
+            write_pre_csv(self.csv_path, self.data)
+        except Exception:
+            APP_LOGGER.exception("確認なし保存失敗: csv=%s", self.csv_path)
+            raise
         self.original_rows = [dict(row) for row in self.data.rows]
         self.dirty = False
         self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
@@ -2652,9 +2892,15 @@ class EditorWindow(QMainWindow):
 
     def encode_post(self) -> None:
         if self.csv_path is None:
+            APP_LOGGER.info("エンコード不可: レシピ未選択")
             QMessageBox.information(self, "未選択", "レシピが開かれていません。")
             return
-        self.save_without_confirm()
+        log_user_action("エンコード開始要求", csv_path=self.csv_path)
+        try:
+            self.save_without_confirm()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"保存に失敗したためエンコードできません: {exc}")
+            return
         output_path = post_output_path_from_csv(self.csv_path)
         log_path = output_path.with_name(f"{output_path.stem}_log.txt")
         self.encode_button.setEnabled(False)
@@ -2669,35 +2915,47 @@ class EditorWindow(QMainWindow):
         if self.dirty:
             result = QMessageBox.question(self, "未保存", "未保存の変更があります。閉じますか？")
             if result != QMessageBox.StandardButton.Yes:
+                log_user_action("ウィンドウを閉じる キャンセル", csv_path=self.csv_path)
                 event.ignore()
                 return
         if self.cap is not None:
             self.cap.release()
+        log_user_action("ウィンドウを閉じる", csv_path=self.csv_path, dirty=self.dirty)
         event.accept()
 
 
 def main() -> None:
+    log_path = setup_app_logging()
+    install_exception_logging()
     parser = argparse.ArgumentParser(description="_pre.csv GUI editor")
     parser.add_argument("input", nargs="?", help="編集する _pre.csv、またはAIレシピを作成する動画")
     args = parser.parse_args()
+    APP_LOGGER.info("アプリログファイル: %s", log_path)
 
-    app = QApplication(sys.argv)
+    app = LoggingApplication(sys.argv)
     input_path = Path(args.input) if args.input else None
     if input_path is None:
+        APP_LOGGER.info("起動モード: 空ウィンドウ")
         window = EditorWindow()
         window.show()
-        sys.exit(app.exec())
+        exit_code = app.exec()
+        APP_LOGGER.info("アプリ終了: exit_code=%s", exit_code)
+        sys.exit(exit_code)
     if not input_path.is_file():
+        APP_LOGGER.error("起動入力ファイルが見つかりません: %s", input_path)
         QMessageBox.critical(None, "Error", f"ファイルが見つかりません: {input_path}")
         return
 
     if input_path.suffix.lower() == ".csv":
+        APP_LOGGER.info("起動モード: CSV編集 input=%s", input_path)
         try:
             window = EditorWindow(input_path)
         except Exception as exc:
+            APP_LOGGER.exception("起動時CSV読込失敗: %s", input_path)
             QMessageBox.critical(None, "Error", str(exc))
             return
     else:
+        APP_LOGGER.info("起動モード: 動画からレシピ生成 input=%s", input_path)
         window = EditorWindow()
         window.show()
         pre_dialog = PreCreateDialog(input_path)
@@ -2706,7 +2964,9 @@ def main() -> None:
         else:
             window.build_empty_ui()
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    APP_LOGGER.info("アプリ終了: exit_code=%s", exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
