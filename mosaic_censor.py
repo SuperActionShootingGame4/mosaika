@@ -62,6 +62,7 @@ YOLO_LABEL_SHORT: dict[str, str] = {
 
 POSE_BACKENDS = ("yolo11", "yolo8", "vitpose-h", "rtmpose", "rtmpose-wholebody")
 CENSOR_EFFECTS = ("mosaic", "blur")
+CENSOR_SHAPES = ("square", "circle")
 MAX_CSV_MOSAICS = 255
 PERSON_SKIP_CONFIDENCE = 0.25
 PERSON_SKIP_IMAGE_SIZE = 320
@@ -118,7 +119,43 @@ def load_pose_model(backend: str):
         raise ValueError(f"未知のポーズモデル: {backend}（選択肢: {POSE_BACKENDS}）")
 
 
-def apply_mosaic(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, intensity: int) -> np.ndarray:
+def apply_roi_shape(
+    frame: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    processed_roi: np.ndarray,
+    shape: str,
+) -> np.ndarray:
+    result = frame.copy()
+    if shape == "square":
+        result[y1:y2, x1:x2] = processed_roi
+        return result
+    if shape != "circle":
+        raise ValueError(f"未知の形状: {shape}")
+
+    roi = frame[y1:y2, x1:x2]
+    h, w = roi.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    center = (max(0, w // 2), max(0, h // 2))
+    axes = (max(1, w // 2), max(1, h // 2))
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+    merged = roi.copy()
+    merged[mask > 0] = processed_roi[mask > 0]
+    result[y1:y2, x1:x2] = merged
+    return result
+
+
+def apply_mosaic(
+    frame: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    intensity: int,
+    shape: str = "square",
+) -> np.ndarray:
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return frame
@@ -126,20 +163,24 @@ def apply_mosaic(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, intensit
     small = cv2.resize(roi, (max(1, w // intensity), max(1, h // intensity)),
                        interpolation=cv2.INTER_LINEAR)
     mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-    result = frame.copy()
-    result[y1:y2, x1:x2] = mosaic
-    return result
+    return apply_roi_shape(frame, x1, y1, x2, y2, mosaic, shape)
 
 
-def apply_blur(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, intensity: int) -> np.ndarray:
+def apply_blur(
+    frame: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    intensity: int,
+    shape: str = "square",
+) -> np.ndarray:
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return frame
     kernel_size = intensity if intensity % 2 == 1 else intensity + 1
     blurred = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
-    result = frame.copy()
-    result[y1:y2, x1:x2] = blurred
-    return result
+    return apply_roi_shape(frame, x1, y1, x2, y2, blurred, shape)
 
 
 def apply_censor_effect(
@@ -150,13 +191,16 @@ def apply_censor_effect(
     y2: int,
     intensity: int,
     effect: str,
+    shape: str = "square",
 ) -> np.ndarray:
     if intensity < 1:
         raise ValueError("intensity は1以上で指定してください")
+    if shape not in CENSOR_SHAPES:
+        raise ValueError(f"未知の形状: {shape}")
     if effect == "blur":
-        return apply_blur(frame, x1, y1, x2, y2, intensity)
+        return apply_blur(frame, x1, y1, x2, y2, intensity, shape)
     if effect == "mosaic":
-        return apply_mosaic(frame, x1, y1, x2, y2, intensity)
+        return apply_mosaic(frame, x1, y1, x2, y2, intensity, shape)
     raise ValueError(f"未知のエフェクト: {effect}")
 
 
@@ -579,8 +623,18 @@ def draw_debug_frame(
     new_boxes: list[tuple[tuple[int, int, int, int], str]],
     applied_boxes: list[tuple[tuple[int, int, int, int], str]],
     frame_idx: int,
+    shape: str = "square",
 ) -> np.ndarray:
     dbg = frame.copy()
+
+    def draw_effect_outline(box: tuple[int, int, int, int], color: tuple[int, int, int], thickness: int) -> None:
+        if shape == "circle":
+            cx = (box[0] + box[2]) // 2
+            cy = (box[1] + box[3]) // 2
+            axes = (max(1, (box[2] - box[0]) // 2), max(1, (box[3] - box[1]) // 2))
+            cv2.ellipse(dbg, (cx, cy), axes, 0, 0, 360, color, thickness)
+        else:
+            cv2.rectangle(dbg, (box[0], box[1]), (box[2], box[3]), color, thickness)
 
     # ポーズスケルトン
     for kps in pose_keypoints:  # kps: np.ndarray [17, 3]
@@ -619,7 +673,7 @@ def draw_debug_frame(
         thickness = 2 if adopted else 1
         display_label = adopted_labels.get(box, detector_display_label(label))
         model_name, part_label = split_model_label(display_label)
-        cv2.rectangle(dbg, (box[0], box[1]), (box[2], box[3]), color, 2)
+        draw_effect_outline(box, color, 2)
         cv2.putText(dbg, f"box_{box_idx} {model_name} mosaic({part_label})",
                     (box[0] + 4, box[1] + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, thickness)
@@ -795,6 +849,7 @@ def write_pre_csv_meta(
     input_path: str,
     intensity: int,
     effect: str,
+    shape: str,
     confidence: float,
     pose_backend: str,
     yolo_nsfw_model_path: str | None,
@@ -808,6 +863,7 @@ def write_pre_csv_meta(
     meta.writerow(["source_video", str(Path(input_path).resolve())])
     meta.writerow(["intensity", intensity])
     meta.writerow(["effect", effect])
+    meta.writerow(["shape", shape])
     meta.writerow(["confidence", confidence])
     meta.writerow(["pose_model", pose_backend])
     meta.writerow(["yolo_nsfw_model", yolo_nsfw_model_path or ""])
@@ -825,6 +881,7 @@ def create_blank_pre_csv(
     effect: str,
     confidence: float,
     detect_every: int,
+    shape: str = "square",
     yolo_nsfw_model_path: str | None = None,
     yolo_confidence: float | None = None,
     max_interpolate_gap: int = 10,
@@ -834,6 +891,9 @@ def create_blank_pre_csv(
     skip_no_person: bool = False,
     progress_callback=None,
 ) -> None:
+    if shape not in CENSOR_SHAPES:
+        raise RuntimeError(f"shape が不正です: {shape}")
+
     cap = cv2.VideoCapture(input_path)
     try:
         if not cap.isOpened():
@@ -859,6 +919,7 @@ def create_blank_pre_csv(
             input_path,
             intensity,
             effect,
+            shape,
             confidence,
             pose_backend,
             yolo_nsfw_model_path,
@@ -955,6 +1016,7 @@ def process_video(
     effect: str,
     confidence: float,
     detect_every: int,
+    shape: str = "square",
     log_file=None,
     debug_path: str | None = None,
     interpolate: bool = True,
@@ -980,6 +1042,9 @@ def process_video(
         from nudenet import NudeDetector
     except ImportError as exc:
         raise RuntimeError("nudenet がインストールされていません。") from exc
+
+    if shape not in CENSOR_SHAPES:
+        raise RuntimeError(f"shape が不正です: {shape}")
 
     try:
         from ultralytics import YOLO
@@ -1058,6 +1123,7 @@ def process_video(
             resolved_input_path,
             intensity,
             effect,
+            shape,
             confidence,
             pose_backend,
             yolo_nsfw_model_path,
@@ -1094,10 +1160,10 @@ def process_video(
 
         res = frm.copy()
         for box, _ in apply_bxs:
-            res = apply_censor_effect(res, *box, intensity, effect)
+            res = apply_censor_effect(res, *box, intensity, effect, shape)
         if render_debug_to_output or debug_writer:
             dbg = draw_debug_frame(res, pose_res, srch_bxs, nnet_bxs,
-                                   confidence, nw_bxs, apply_bxs, fidx)
+                                   confidence, nw_bxs, apply_bxs, fidx, shape)
         if writer:
             if render_debug_to_output:
                 writer.write(dbg)
@@ -1312,6 +1378,7 @@ def process_single_frame(
     yolo_confidence: float = 0.03,
     pose_backend: str = "yolo11",
     no_crotch: bool = False,
+    shape: str = "square",
 ) -> None:
     def _log(msg: str) -> None:
         if log_file:
@@ -1324,6 +1391,8 @@ def process_single_frame(
         from ultralytics import YOLO
     except ImportError as exc:
         raise RuntimeError(f"必要なライブラリがインストールされていません: {exc}") from exc
+    if shape not in CENSOR_SHAPES:
+        raise RuntimeError(f"shape が不正です: {shape}")
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -1394,13 +1463,13 @@ def process_single_frame(
 
     result = frame.copy()
     for box, _ in new_boxes:
-        result = apply_censor_effect(result, *box, intensity, effect)
+        result = apply_censor_effect(result, *box, intensity, effect, shape)
 
     cv2.imwrite(str(source_path), frame)
     cv2.imwrite(str(censored_path), result)
     if debug:
         dbg = draw_debug_frame(result, pose_kps, search_boxes, all_detector_boxes,
-                               confidence, new_boxes, new_boxes, frame_number)
+                               confidence, new_boxes, new_boxes, frame_number, shape)
         cv2.imwrite(str(debug_path), dbg)
 
     _log(
@@ -1461,6 +1530,7 @@ def process_post_from_csv(
     output_path: str | None,
     log_file=None,
     effect_override: str | None = None,
+    shape_override: str | None = None,
     progress_callback=None,
 ) -> None:
     def _log(msg: str) -> None:
@@ -1485,6 +1555,9 @@ def process_post_from_csv(
     effect = effect_override or meta.get("effect", "mosaic")
     if effect not in CENSOR_EFFECTS:
         raise RuntimeError(f"CSVの effect が不正です: {effect}")
+    shape = shape_override or meta.get("shape", "square")
+    if shape not in CENSOR_SHAPES:
+        raise RuntimeError(f"CSVの shape が不正です: {shape}")
 
     if not rows:
         raise RuntimeError(f"CSVにフレーム行がありません: {csv_path}")
@@ -1541,7 +1614,7 @@ def process_post_from_csv(
                 current_pos = frame_idx + 1
 
                 for box in boxes_from_csv_row(row):
-                    frame = apply_censor_effect(frame, *box, intensity, effect)
+                    frame = apply_censor_effect(frame, *box, intensity, effect, shape)
                 writer.write(frame)
                 processed_rows += 1
                 pbar.update(1)
@@ -1614,6 +1687,8 @@ def main() -> None:
                         help="モザイクまたはぼかしの強度 (デフォルト: 15)")
     parser.add_argument("--effect", choices=list(CENSOR_EFFECTS), default=None,
                         help="適用するエフェクト: mosaic または blur (デフォルト: mosaic)")
+    parser.add_argument("--shape", choices=list(CENSOR_SHAPES), default=None,
+                        help="適用範囲の形状: square または circle (デフォルト: square)")
     parser.add_argument("--confidence", type=float, default=0.03, metavar="F",
                         help="NudeNet の信頼度閾値 (デフォルト: 0.03)")
     parser.add_argument("--detect-every", type=int, default=1, metavar="N",
@@ -1645,6 +1720,7 @@ def main() -> None:
 
     args = parser.parse_args()
     effect = args.effect or "mosaic"
+    shape = args.shape or "square"
 
     if not os.path.isfile(args.input):
         print(f"エラー: ファイルが見つかりません: {args.input}", file=sys.stderr)
@@ -1684,6 +1760,7 @@ def main() -> None:
                     output_path=output_path,
                     log_file=lf,
                     effect_override=args.effect,
+                    shape_override=args.shape,
                 )
             except KeyboardInterrupt:
                 print("\n中断されました", file=sys.stderr)
@@ -1701,6 +1778,7 @@ def main() -> None:
             log(f"単発フレーム  : {args.frame}", lf)
             log(f"強度          : {args.intensity}", lf)
             log(f"エフェクト     : {effect}", lf)
+            log(f"形状          : {shape}", lf)
             log(f"信頼度閾値    : {args.confidence}", lf)
             log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
             log(f"人物なしスキップ: {'有効' if args.skip_no_person else '無効'}", lf)
@@ -1715,6 +1793,7 @@ def main() -> None:
                     frame_number=args.frame,
                     intensity=args.intensity,
                     effect=effect,
+                    shape=shape,
                     confidence=args.confidence,
                     log_file=lf,
                     debug=args.debug,
@@ -1744,6 +1823,7 @@ def main() -> None:
             log(f"ログ          : {log_path}", lf)
             log(f"強度          : {args.intensity}", lf)
             log(f"エフェクト     : {effect}", lf)
+            log(f"形状          : {shape}", lf)
             log(f"信頼度閾値    : {args.confidence}", lf)
             log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
             log(f"ポーズモデル  : {args.pose_model}", lf)
@@ -1762,6 +1842,7 @@ def main() -> None:
                     output_path=None,
                     intensity=args.intensity,
                     effect=effect,
+                    shape=shape,
                     confidence=args.confidence,
                     detect_every=args.detect_every,
                     log_file=lf,
@@ -1800,6 +1881,7 @@ def main() -> None:
             log(f"デバッグ動画  : {debug_path}", lf)
         log(f"強度          : {args.intensity}", lf)
         log(f"エフェクト     : {effect}", lf)
+        log(f"形状          : {shape}", lf)
         log(f"信頼度閾値    : {args.confidence}", lf)
         log(f"股間領域フィルタ: {'無効' if args.no_crotch else '有効'}", lf)
         log(f"人物なしスキップ: {'有効' if args.skip_no_person else '無効'}", lf)
@@ -1819,6 +1901,7 @@ def main() -> None:
                 output_path=output_path,
                 intensity=args.intensity,
                 effect=effect,
+                shape=shape,
                 confidence=args.confidence,
                 detect_every=args.detect_every,
                 log_file=lf,

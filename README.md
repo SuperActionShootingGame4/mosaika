@@ -67,6 +67,9 @@ python mosaic_censor.py input.mp4
 # ガウシアンぼかしを使う
 python mosaic_censor.py input.mp4 --effect blur
 
+# 長方形枠の内側を楕円形にしてエフェクトをかける
+python mosaic_censor.py input.mp4 --shape circle
+
 # モザイクまたはぼかしの強度を変える（デフォルト: 15）
 python mosaic_censor.py input.mp4 --intensity 20
 
@@ -112,11 +115,12 @@ CSV エディタでは、`←` キーで1つ前のフレーム、`→` キーで
 `現在フレームを元に戻す` ボタンを押すと、表示中フレームのモザイク枠と `comment` を CSV エディタ起動時の状態へ戻す。
 モザイク詳細マトリクスの `score` 列には、検出時のスコアを表示する。手動追加や座標編集を行った枠では空欄になる。
 画像上の既存枠は左ドラッグで移動・リサイズする。新規作成または選択中枠の作り直しは、画像上を右ドラッグして範囲を指定する。枠外の左クリックでは新しい枠を作成しない。
-`mosaicプレビュー` を ON にすると、有効な枠へ CSV の `effect` と `intensity` で指定されたエフェクトを適用して表示する。
+モザイク詳細マトリクスの `Trace` を `T` にすると、選択中のモザイク枠を `Start` から `End` の frame_no 範囲で自動追跡できる。`Start` と `End` には追跡したい開始・終了 frame_no を入力する。`T scale` を `T` にすると、追跡中の枠サイズ変化も許可する。追跡はテンプレートマッチングとオプティカルフローを併用するため、対象物が隠れる、向きが大きく変わる、または見た目の特徴が少ない場合は途中で見失うことがある。
+`mosaicプレビュー` を ON にすると、有効な枠へ CSV の `effect`、`shape`、`intensity` で指定されたエフェクトを適用して表示する。`shape` は `square` または `circle` を選択でき、`circle` では枠の矩形範囲を外接枠とする楕円形でモザイクまたはぼかしを適用する。
 CSV エディタの表示画像は、pre 動画ではなく CSV の `source_video` に記録された元動画から読み込む。
 Linux 向け単一実行ファイルは `./build_linux_editor.sh` で `dist/mosaika-pre-csv-editor` に生成する。配布先では `./mosaika-pre-csv-editor input_pre.csv` で起動する。CSV の `source_video` に記録されたパスが見つからない場合は、CSV と同じフォルダにある同名動画を読み込む。
 モザイク詳細マトリクスで枠を選択し、`Del` キーを押すと選択中の枠を OFF にできる。
-CSV行マトリクスの上には `intensity`、`effect`、`confidence`、`pose_model`、`yolo_nsfw_model`、`interpolate_gap`、`no_crotch` を表示する。`effect` と `intensity` は編集でき、`mosaicプレビュー` が ON の場合は表示へ即時反映する。
+CSV行マトリクスの上には `intensity`、`effect`、`shape`、`confidence`、`pose_model`、`yolo_nsfw_model`、`interpolate_gap`、`no_crotch` を表示する。`effect`、`shape`、`intensity` は編集でき、`mosaicプレビュー` が ON の場合は表示へ即時反映する。
 
 ### 全オプション一覧
 
@@ -125,6 +129,7 @@ CSV行マトリクスの上には `intensity`、`effect`、`confidence`、`pose_
 | `--pre` | 無効 | 目視確認用の `_pre.mp4` と編集用CSVを作成 |
 | `--post` | 無効 | CSVの `source_video` を読み、ONの座標だけで `_post.mp4` を作成 |
 | `--effect NAME` | `mosaic` | エフェクト（`mosaic` または `blur`） |
+| `--shape NAME` | `square` | 適用範囲の形状（`square` または `circle`） |
 | `--intensity N` | 15 | モザイクまたはぼかしの強度 |
 | `--confidence F` | 0.03 | NudeNet の信頼度閾値 |
 | `--detect-every N` | 1 | N フレームごとに検出（1 = 全フレーム） |

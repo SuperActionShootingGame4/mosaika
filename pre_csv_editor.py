@@ -61,6 +61,7 @@ from PyQt6.QtWidgets import (
 from app_version import APP_VERSION
 from mosaic_censor import (
     CENSOR_EFFECTS,
+    CENSOR_SHAPES,
     POSE_BACKENDS,
     SKELETON_EDGES,
     create_blank_pre_csv,
@@ -291,6 +292,7 @@ def save_recipe_config(settings: dict) -> None:
         f"confidence = {toml_value(settings['confidence'])}",
         f"intensity = {toml_value(settings['intensity'])}",
         f"effect = {toml_value(settings['effect'])}",
+        f"shape = {toml_value(settings['shape'])}",
         f"detect_every = {toml_value(settings['detect_every'])}",
         f"interpolate_gap = {toml_value(settings['interpolate_gap'])}",
         f"yolo_nsfw_model = {toml_value(settings['yolo_nsfw_model'])}",
@@ -397,6 +399,7 @@ class PreCreateWorker(QObject):
                         csv_path=str(self.csv_path),
                         intensity=self.options["intensity"],
                         effect=self.options["effect"],
+                        shape=self.options["shape"],
                         confidence=self.options["confidence"],
                         detect_every=self.options["detect_every"],
                         yolo_nsfw_model_path=self.options["yolo_nsfw_model"],
@@ -414,6 +417,7 @@ class PreCreateWorker(QObject):
                         output_path=None,
                         intensity=self.options["intensity"],
                         effect=self.options["effect"],
+                        shape=self.options["shape"],
                         confidence=self.options["confidence"],
                         detect_every=self.options["detect_every"],
                         log_file=lf,
@@ -548,6 +552,10 @@ class PreCreateDialog(QDialog):
         self.effect_combo.addItems(list(CENSOR_EFFECTS))
         effect = config_text(self.config, "effect", "mosaic")
         self.effect_combo.setCurrentText(effect if effect in CENSOR_EFFECTS else "mosaic")
+        self.shape_combo = QComboBox()
+        self.shape_combo.addItems(list(CENSOR_SHAPES))
+        shape = config_text(self.config, "shape", "square")
+        self.shape_combo.setCurrentText(shape if shape in CENSOR_SHAPES else "square")
         self.confidence_spin = QDoubleSpinBox()
         self.confidence_spin.setRange(0.0, 1.0)
         self.confidence_spin.setDecimals(3)
@@ -603,6 +611,7 @@ class PreCreateDialog(QDialog):
         form.addRow("confidence ※検出の信頼度しきい値", self.confidence_spin)
         form.addRow("intensity ※モザイク/ぼかしの強度", self.intensity_spin)
         form.addRow("effect", self.effect_combo)
+        form.addRow("shape", self.shape_combo)
         form.addRow("detect_every ※何フレームごとにAI検出するか", self.detect_every_spin)
         form.addRow("interpolate_gap ※検出漏れを補間する最大フレーム数", self.interpolate_gap_spin)
         form.addRow("yolo_nsfw_model ※未選択時はNudeNetを使用", yolo_layout)
@@ -700,6 +709,7 @@ class PreCreateDialog(QDialog):
             "confidence": self.confidence_spin.value(),
             "intensity": self.intensity_spin.value(),
             "effect": self.effect_combo.currentText(),
+            "shape": self.shape_combo.currentText(),
             "detect_every": self.detect_every_spin.value(),
             "interpolate_gap": self.interpolate_gap_spin.value(),
             "yolo_nsfw_model": self.yolo_model_input.text().strip(),
@@ -745,6 +755,7 @@ class PreCreateDialog(QDialog):
             "confidence": self.confidence_spin.value(),
             "intensity": self.intensity_spin.value(),
             "effect": self.effect_combo.currentText(),
+            "shape": self.shape_combo.currentText(),
             "no_crotch": self.no_crotch_check.isChecked(),
             "detect_every": self.detect_every_spin.value(),
             "interpolate_gap": self.interpolate_gap_spin.value(),
@@ -812,7 +823,7 @@ class PreCreateDialog(QDialog):
         )
         self.running = running
         for widget in (
-            self.pose_combo, self.effect_combo, self.confidence_spin, self.intensity_spin,
+            self.pose_combo, self.effect_combo, self.shape_combo, self.confidence_spin, self.intensity_spin,
             self.detect_every_spin, self.interpolate_gap_spin, self.no_crotch_check,
             self.skip_no_person_check, self.blank_recipe_check,
             self.all_frames_check, self.start_spin,
@@ -1018,14 +1029,17 @@ def read_pre_csv(path: Path) -> CsvData:
     raise RuntimeError("frame_no ヘッダ行が見つかりません")
 
 
-def write_pre_csv(path: Path, data: CsvData) -> None:
+def write_pre_csv(path: Path, data: CsvData, progress_callback=None) -> None:
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(data.meta)
         dict_writer = csv.DictWriter(f, fieldnames=data.fieldnames, extrasaction="ignore")
         dict_writer.writeheader()
-        for row in data.rows:
+        total = len(data.rows)
+        for idx, row in enumerate(data.rows):
             dict_writer.writerow(row)
+            if progress_callback is not None and (idx % 20 == 0 or idx + 1 == total):
+                progress_callback(idx + 1, total)
 
 
 def set_meta_value(data: CsvData, key: str, value: str) -> None:
@@ -1279,6 +1293,7 @@ def apply_preview_effect(
     rect: QRect,
     intensity: int,
     effect: str,
+    shape: str,
 ) -> None:
     x1, y1 = rect.left(), rect.top()
     x2, y2 = rect.right() + 1, rect.bottom() + 1
@@ -1288,16 +1303,30 @@ def apply_preview_effect(
     h, w = roi.shape[:2]
     if effect == "blur":
         kernel_size = intensity if intensity % 2 == 1 else intensity + 1
-        frame[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
+        processed = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
+        if shape == "circle":
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.ellipse(mask, (max(0, w // 2), max(0, h // 2)),
+                        (max(1, w // 2), max(1, h // 2)), 0, 0, 360, 255, -1)
+            roi[mask > 0] = processed[mask > 0]
+        else:
+            frame[y1:y2, x1:x2] = processed
         return
     small = cv2.resize(
         roi,
         (max(1, w // intensity), max(1, h // intensity)),
         interpolation=cv2.INTER_LINEAR,
     )
-    frame[y1:y2, x1:x2] = cv2.resize(
+    processed = cv2.resize(
         small, (w, h), interpolation=cv2.INTER_NEAREST
     )
+    if shape == "circle":
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(mask, (max(0, w // 2), max(0, h // 2)),
+                    (max(1, w // 2), max(1, h // 2)), 0, 0, 360, 255, -1)
+        roi[mask > 0] = processed[mask > 0]
+    else:
+        frame[y1:y2, x1:x2] = processed
 
 
 def draw_pose_overlay(
@@ -1654,6 +1683,7 @@ class FrameCanvas(QWidget):
 
         current = self.parent_window.current_row()
         selected = self.parent_window.selected_slot
+        shape = self.parent_window.data.meta_dict.get("shape", "square")
         for slot in range(1, MAX_MOSAICS + 1):
             rect = get_rect(current, slot)
             if rect is None:
@@ -1669,7 +1699,10 @@ class FrameCanvas(QWidget):
                 pen = QPen(QColor(180, 180, 180), 2, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(wrect)
+            if shape == "circle":
+                painter.drawEllipse(wrect)
+            else:
+                painter.drawRect(wrect)
             painter.drawText(wrect.topLeft() + QPointF(4, -4), f"mosaic{slot}")
             if slot == selected:
                 painter.setBrush(QColor(255, 210, 60))
@@ -1838,6 +1871,7 @@ class EditorWindow(QMainWindow):
         super().__init__()
         APP_LOGGER.info("編集ウィンドウ初期化: csv_path=%s", csv_path)
         self.csv_path: Path | None = None
+        self.progress_dialog: QProgressDialog | None = None
         self.dirty = False
         self.editor_windows: list[EditorWindow] = []
         self.cap = None
@@ -2047,8 +2081,13 @@ class EditorWindow(QMainWindow):
         meta = self.data.meta_dict
         meta_layout = QFormLayout()
         self.effect_combo = QComboBox()
-        self.effect_combo.addItems(["mosaic", "blur"])
-        self.effect_combo.setCurrentText(meta.get("effect", "mosaic"))
+        self.effect_combo.addItems(list(CENSOR_EFFECTS))
+        effect = meta.get("effect", "mosaic")
+        self.effect_combo.setCurrentText(effect if effect in CENSOR_EFFECTS else "mosaic")
+        self.shape_combo = QComboBox()
+        self.shape_combo.addItems(list(CENSOR_SHAPES))
+        shape = meta.get("shape", "square")
+        self.shape_combo.setCurrentText(shape if shape in CENSOR_SHAPES else "square")
         self.intensity_spin = QSpinBox()
         self.intensity_spin.setRange(1, 2147483647)
         self.intensity_spin.setFixedWidth(70)
@@ -2066,6 +2105,7 @@ class EditorWindow(QMainWindow):
         intensity_layout.addWidget(self.intensity_slider, stretch=1)
         meta_layout.addRow("intensity", intensity_layout)
         meta_layout.addRow("effect", self.effect_combo)
+        meta_layout.addRow("shape", self.shape_combo)
         for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch", "skip_no_person"):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
@@ -2129,6 +2169,7 @@ class EditorWindow(QMainWindow):
         self.crotch_overlay_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.skeleton_overlay_checkbox.stateChanged.connect(self.refresh_canvas_frame)
         self.effect_combo.currentTextChanged.connect(self.update_preview_meta)
+        self.shape_combo.currentTextChanged.connect(self.update_preview_meta)
         self.intensity_slider.valueChanged.connect(self.intensity_spin.setValue)
         self.intensity_spin.valueChanged.connect(self.sync_intensity_slider)
         self.intensity_spin.valueChanged.connect(self.update_preview_meta)
@@ -2232,6 +2273,41 @@ class EditorWindow(QMainWindow):
         if not self.windowTitle().endswith("*"):
             self.setWindowTitle(self.windowTitle() + " *")
 
+    def reusable_progress_dialog(self, title: str, label: str, maximum: int) -> QProgressDialog:
+        if self.progress_dialog is None:
+            self.progress_dialog = QProgressDialog(self)
+            self.progress_dialog.setCancelButton(None)
+            self.progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            self.progress_dialog.setMinimumDuration(0)
+            self.progress_dialog.setAutoClose(False)
+            self.progress_dialog.setAutoReset(False)
+        progress = self.progress_dialog
+        progress.setWindowTitle(title)
+        progress.setLabelText(label)
+        progress.setRange(0, max(1, maximum))
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        return progress
+
+    def update_progress_dialog(
+        self,
+        progress: QProgressDialog,
+        message: str,
+        done: int,
+        total: int,
+        started_at: float,
+    ) -> None:
+        percent = int(done * 100 / max(1, total))
+        elapsed = time.monotonic() - started_at
+        remaining = elapsed * (total - done) / done if done else 0
+        progress.setLabelText(
+            f"{message} {percent}%  残り "
+            f"{time.strftime('%H:%M:%S', time.gmtime(max(0, remaining)))}"
+        )
+        progress.setValue(done)
+        QApplication.processEvents()
+
     def load_frame(self) -> None:
         frame_no_text = self.current_row().get("frame_no", "")
         try:
@@ -2293,12 +2369,13 @@ class EditorWindow(QMainWindow):
             except ValueError:
                 intensity = 15
             effect = meta.get("effect", "mosaic")
+            shape = meta.get("shape", "square")
             for slot in range(1, MAX_MOSAICS + 1):
                 if not is_on(self.current_row().get(f"mosaic{slot}_on")):
                     continue
                 rect = get_rect(self.current_row(), slot)
                 if rect is not None:
-                    apply_preview_effect(frame, rect, intensity, effect)
+                    apply_preview_effect(frame, rect, intensity, effect, shape)
         draw_crotch = self.crotch_overlay_checkbox.isChecked()
         draw_skeleton = self.skeleton_overlay_checkbox.isChecked()
         if draw_crotch or draw_skeleton:
@@ -2319,12 +2396,13 @@ class EditorWindow(QMainWindow):
         except ValueError:
             intensity = 15
         effect = meta.get("effect", "mosaic")
+        shape = meta.get("shape", "square")
         for slot in range(1, MAX_MOSAICS + 1):
             if not is_on(row.get(f"mosaic{slot}_on")):
                 continue
             rect = get_rect(row, slot)
             if rect is not None:
-                apply_preview_effect(result, rect, intensity, effect)
+                apply_preview_effect(result, rect, intensity, effect, shape)
         return result
 
     def playback_frame_at_index(self, index: int) -> np.ndarray | None:
@@ -2458,8 +2536,14 @@ class EditorWindow(QMainWindow):
 
     def update_preview_meta(self, *args) -> None:
         set_meta_value(self.data, "effect", self.effect_combo.currentText())
+        set_meta_value(self.data, "shape", self.shape_combo.currentText())
         set_meta_value(self.data, "intensity", str(self.intensity_spin.value()))
-        log_user_action("プレビュー設定変更", effect=self.effect_combo.currentText(), intensity=self.intensity_spin.value())
+        log_user_action(
+            "プレビュー設定変更",
+            effect=self.effect_combo.currentText(),
+            shape=self.shape_combo.currentText(),
+            intensity=self.intensity_spin.value(),
+        )
         self.mark_dirty()
         self.refresh_canvas_frame()
 
@@ -2472,37 +2556,43 @@ class EditorWindow(QMainWindow):
         self,
         show_progress: bool = False,
         progress_message: str = "トリミング範囲を反映中...",
+        progress: QProgressDialog | None = None,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
     ) -> None:
         keep_ranges = self.keep_ranges()
-        progress = None
+        owns_progress = False
         start_time = time.monotonic()
         total = len(self.data.rows)
+        progress_total = progress_total or total
         if show_progress:
-            progress = QProgressDialog(progress_message, "", 0, max(1, total), self)
-            progress.setWindowTitle("処理中")
-            progress.setCancelButton(None)
-            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
+            if progress is None:
+                progress = self.reusable_progress_dialog("処理中", progress_message, max(1, progress_total))
+                owns_progress = True
+            else:
+                progress.setRange(0, max(1, progress_total))
+                progress.setLabelText(progress_message)
+                progress.setValue(progress_offset)
+                progress.show()
+                QApplication.processEvents()
         self.frame_table.blockSignals(True)
         try:
             for idx, row in enumerate(self.data.rows):
                 self.update_frame_table_row(idx, row, keep_ranges)
                 if progress is not None and (idx % 20 == 0 or idx + 1 == total):
                     done = idx + 1
-                    elapsed = time.monotonic() - start_time
-                    percent = int(done * 100 / max(1, total))
-                    remaining = elapsed * (total - done) / done if done else 0
-                    progress.setLabelText(
-                        f"{progress_message} {percent}%  残り "
-                        f"{time.strftime('%H:%M:%S', time.gmtime(max(0, remaining)))}"
+                    self.update_progress_dialog(
+                        progress,
+                        progress_message,
+                        min(progress_total, progress_offset + done),
+                        progress_total,
+                        start_time,
                     )
-                    progress.setValue(done)
-                    QApplication.processEvents()
         finally:
             self.frame_table.blockSignals(False)
-            if progress is not None:
-                progress.setValue(max(1, total))
+            if progress is not None and owns_progress:
+                progress.setValue(max(1, progress_total))
+                progress.hide()
         self.sequence_slider.set_person_ranges(self.person_ranges())
 
     def row_modified(self, idx: int) -> bool:
@@ -3156,29 +3246,56 @@ class EditorWindow(QMainWindow):
             return
         log_user_action("保存", csv_path=self.csv_path)
         try:
-            write_pre_csv(self.csv_path, self.data)
+            self.save_current_recipe_with_progress("レシピを保存中...")
         except Exception as exc:
             APP_LOGGER.exception("保存失敗: csv=%s", self.csv_path)
             QMessageBox.critical(self, "Error", f"保存に失敗しました: {exc}")
             return
-        self.original_rows = [dict(row) for row in self.data.rows]
-        self.dirty = False
-        self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
-        self.populate_frame_table()
 
     def save_without_confirm(self) -> None:
         if self.csv_path is None:
             return
         APP_LOGGER.info("確認なし保存: csv=%s", self.csv_path)
         try:
-            write_pre_csv(self.csv_path, self.data)
+            self.save_current_recipe_with_progress("レシピを保存中...")
         except Exception:
             APP_LOGGER.exception("確認なし保存失敗: csv=%s", self.csv_path)
             raise
-        self.original_rows = [dict(row) for row in self.data.rows]
-        self.dirty = False
-        self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
-        self.populate_frame_table()
+
+    def save_current_recipe_with_progress(self, message: str) -> None:
+        if self.csv_path is None:
+            return
+        total_rows = len(self.data.rows)
+        total_steps = max(1, total_rows * 2)
+        started_at = time.monotonic()
+        progress = self.reusable_progress_dialog("保存中", message, total_steps)
+
+        def on_write_progress(current: int, total: int) -> None:
+            self.update_progress_dialog(
+                progress,
+                "CSVを書き込み中...",
+                min(total_steps, current),
+                total_steps,
+                started_at,
+            )
+
+        try:
+            write_pre_csv(self.csv_path, self.data, progress_callback=on_write_progress)
+            self.original_rows = [dict(row) for row in self.data.rows]
+            self.dirty = False
+            self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
+            self.populate_frame_table(
+                show_progress=True,
+                progress_message="画面を更新中...",
+                progress=progress,
+                progress_offset=total_rows,
+                progress_total=total_steps,
+            )
+            progress.setValue(total_steps)
+            progress.setLabelText("保存完了")
+            QApplication.processEvents()
+        finally:
+            progress.hide()
 
     def encode_post(self) -> None:
         if self.csv_path is None:
