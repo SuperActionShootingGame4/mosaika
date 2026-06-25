@@ -9,17 +9,29 @@ echo.
 
 set PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe
 if not exist "%PYTHON%" (
-    echo エラー: .venv が見つかりません。
-    echo 先に以下を実行してください:
-    echo   python -m venv .venv
-    echo   .venv\Scripts\pip install -r requirements.txt
-    echo   .venv\Scripts\pip install pyinstaller
-    pause
-    exit /b 1
+    echo .venv が見つかりません。作成します...
+    python -m venv "%SCRIPT_DIR%.venv"
+    if errorlevel 1 (
+        echo エラー: .venv の作成に失敗しました。
+        echo Python がインストールされ、PATH に登録されているか確認してください。
+        pause
+        exit /b 1
+    )
 )
+
+echo 依存関係を確認・インストール中...
+"%PYTHON%" -m pip install --upgrade pip
+if errorlevel 1 ( echo pip の更新に失敗しました & pause & exit /b 1 )
+
+"%PYTHON%" -m pip install -r "%SCRIPT_DIR%requirements.txt"
+if errorlevel 1 ( echo requirements.txt のインストールに失敗しました & pause & exit /b 1 )
+
+"%PYTHON%" -m pip install pyinstaller
+if errorlevel 1 ( echo pyinstaller のインストールに失敗しました & pause & exit /b 1 )
 
 echo CPU 版 PyTorch をインストール中（CUDA 版は不要で巨大なため）...
 "%PYTHON%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --quiet
+if errorlevel 1 ( echo PyTorch のインストールに失敗しました & pause & exit /b 1 )
 
 "%PYTHON%" -m PyInstaller --version > nul 2>&1
 if errorlevel 1 (
