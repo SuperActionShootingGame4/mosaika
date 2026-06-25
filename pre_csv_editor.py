@@ -172,6 +172,13 @@ def install_exception_logging() -> None:
         file_name = getattr(context, "file", "") or ""
         line = getattr(context, "line", 0) or 0
         APP_LOGGER.log(level, "Qtメッセージ: %s %s (%s:%s)", mode_name, message, file_name, line)
+        if "Fatal" in mode_name:
+            APP_LOGGER.error("Qt Fatal 発生時のPython全スレッドスタックを出力します")
+            for handler in APP_LOGGER.handlers:
+                handler.flush()
+            if APP_LOG_FILE_HANDLE is not None:
+                faulthandler.dump_traceback(file=APP_LOG_FILE_HANDLE, all_threads=True)
+                APP_LOG_FILE_HANDLE.flush()
 
     sys.excepthook = excepthook
     if hasattr(threading, "excepthook"):
@@ -330,19 +337,45 @@ class PreCreateWorker(QObject):
         self.log_path = log_path
         self.options = options
         self.cancel_requested = False
+        self._last_logged_progress = -1
+        APP_LOGGER.info(
+            "PreCreateWorker作成: worker_id=%s video=%s csv=%s log=%s",
+            id(self),
+            self.video_path,
+            self.csv_path,
+            self.log_path,
+        )
 
     def cancel(self) -> None:
+        APP_LOGGER.info("PreCreateWorkerキャンセル要求: worker_id=%s", id(self))
         self.cancel_requested = True
 
     def emit_progress(self, current: int, total: int, elapsed: float) -> None:
         if self.cancel_requested:
+            APP_LOGGER.info(
+                "PreCreateWorkerキャンセル検知: worker_id=%s current=%s total=%s elapsed=%.3f",
+                id(self),
+                current,
+                total,
+                elapsed,
+            )
             raise RecipeGenerationCancelled()
+        if current == 0 or current == total or current - self._last_logged_progress >= 100:
+            APP_LOGGER.info(
+                "レシピ生成進捗: worker_id=%s current=%s total=%s elapsed=%.3f",
+                id(self),
+                current,
+                total,
+                elapsed,
+            )
+            self._last_logged_progress = current
         self.progress.emit(current, total, elapsed)
 
     def run(self) -> None:
         try:
             APP_LOGGER.info(
-                "レシピ生成開始: video=%s csv=%s log=%s options=%s",
+                "PreCreateWorker.run開始: worker_id=%s video=%s csv=%s log=%s options=%s",
+                id(self),
                 self.video_path,
                 self.csv_path,
                 self.log_path,
@@ -375,15 +408,23 @@ class PreCreateWorker(QObject):
                     progress_callback=self.emit_progress,
                     skip_no_person=self.options["skip_no_person"],
                 )
-            APP_LOGGER.info("レシピ生成完了: csv=%s", self.csv_path)
+            APP_LOGGER.info("PreCreateWorker.run完了: worker_id=%s csv=%s", id(self), self.csv_path)
             self.finished.emit(str(self.csv_path))
+            APP_LOGGER.info("PreCreateWorker.finished emit済み: worker_id=%s", id(self))
         except RecipeGenerationCancelled:
-            APP_LOGGER.info("レシピ生成キャンセル: csv=%s", self.csv_path)
+            APP_LOGGER.info("PreCreateWorker.runキャンセル: worker_id=%s csv=%s", id(self), self.csv_path)
             self.csv_path.unlink(missing_ok=True)
             self.failed.emit("レシピ生成をキャンセルしました。")
+            APP_LOGGER.info("PreCreateWorker.failed emit済み: worker_id=%s reason=cancel", id(self))
         except Exception as exc:
-            APP_LOGGER.exception("レシピ生成エラー: video=%s csv=%s", self.video_path, self.csv_path)
+            APP_LOGGER.exception(
+                "PreCreateWorker.run例外: worker_id=%s video=%s csv=%s",
+                id(self),
+                self.video_path,
+                self.csv_path,
+            )
             self.failed.emit(str(exc))
+            APP_LOGGER.info("PreCreateWorker.failed emit済み: worker_id=%s reason=exception", id(self))
 
 
 class PostWorker(QObject):
@@ -422,6 +463,10 @@ class PostWorker(QObject):
 class PreCreateDialog(QDialog):
     def __init__(self, video_path: Path) -> None:
         super().__init__()
+        self.destroyed.connect(lambda _obj=None, dialog_id=id(self): APP_LOGGER.info(
+            "PreCreateDialog破棄: dialog_id=%s",
+            dialog_id,
+        ))
         self.config = load_recipe_config()
         self.video_path = video_path
         self.result_csv: Path | None = None
@@ -432,7 +477,12 @@ class PreCreateDialog(QDialog):
         self.setWindowTitle("レシピ生成ウィンドウ")
         self.resize(520, 360)
         self.total_frames = self.detect_total_frames()
-        APP_LOGGER.info("レシピ生成ダイアログ表示: video=%s total_frames=%s", self.video_path, self.total_frames)
+        APP_LOGGER.info(
+            "PreCreateDialog作成: dialog_id=%s video=%s total_frames=%s",
+            id(self),
+            self.video_path,
+            self.total_frames,
+        )
         self.build_ui()
 
     def detect_total_frames(self) -> int:
@@ -446,6 +496,7 @@ class PreCreateDialog(QDialog):
             cap.release()
 
     def build_ui(self) -> None:
+        APP_LOGGER.info("PreCreateDialog UI構築開始: dialog_id=%s", id(self))
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -538,6 +589,10 @@ class PreCreateDialog(QDialog):
         self.video_path_input.editingFinished.connect(self.update_video_path_from_input)
         self.start_button.clicked.connect(self.start_pre_create)
         self.cancel_button.clicked.connect(self.cancel_or_reject)
+        APP_LOGGER.info(
+            "PreCreateDialog UI構築完了: dialog_id=%s start_button_role=ActionRole cancel_button_role=RejectRole",
+            id(self),
+        )
 
     def update_frame_enabled(self) -> None:
         enabled = not self.all_frames_check.isChecked()
@@ -617,7 +672,15 @@ class PreCreateDialog(QDialog):
         }
 
     def start_pre_create(self) -> None:
+        APP_LOGGER.info(
+            "PreCreateDialog.start_pre_create呼び出し: dialog_id=%s running=%s thread=%s worker=%s",
+            id(self),
+            self.running,
+            id(self.thread) if self.thread is not None else None,
+            id(self.worker) if self.worker is not None else None,
+        )
         if self.running:
+            APP_LOGGER.warning("レシピ生成二重開始を無視: dialog_id=%s", id(self))
             return
         if not self.update_video_path_from_input():
             return
@@ -657,6 +720,39 @@ class PreCreateDialog(QDialog):
         self.progress_label.setText("AIレシピを作成中...")
         self.thread = QThread(self)
         self.worker = PreCreateWorker(self.video_path, csv_path, log_path, options)
+        thread_id = id(self.thread)
+        worker_id = id(self.worker)
+        dialog_id = id(self)
+        APP_LOGGER.info(
+            "PreCreateDialogスレッド作成: dialog_id=%s thread_id=%s worker_id=%s",
+            dialog_id,
+            thread_id,
+            worker_id,
+        )
+        self.thread.started.connect(lambda: APP_LOGGER.info(
+            "PreCreateDialogスレッドstarted: dialog_id=%s thread_id=%s isRunning=%s",
+            dialog_id,
+            thread_id,
+            self.thread.isRunning() if self.thread is not None else None,
+        ))
+        self.thread.finished.connect(lambda: APP_LOGGER.info(
+            "PreCreateDialogスレッドfinished: dialog_id=%s thread_id=%s running=%s worker_failed=%s result_csv=%s",
+            dialog_id,
+            thread_id,
+            self.running,
+            self.worker_failed,
+            self.result_csv,
+        ))
+        self.thread.destroyed.connect(lambda _obj=None: APP_LOGGER.info(
+            "PreCreateDialogスレッド破棄: dialog_id=%s thread_id=%s",
+            dialog_id,
+            thread_id,
+        ))
+        self.worker.destroyed.connect(lambda _obj=None: APP_LOGGER.info(
+            "PreCreateDialog worker破棄: dialog_id=%s worker_id=%s",
+            dialog_id,
+            worker_id,
+        ))
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.update_progress)
@@ -666,9 +762,27 @@ class PreCreateDialog(QDialog):
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.pre_thread_finished)
+        APP_LOGGER.info(
+            "PreCreateDialogスレッド開始直前: dialog_id=%s thread_id=%s worker_id=%s",
+            dialog_id,
+            thread_id,
+            worker_id,
+        )
         self.thread.start()
+        APP_LOGGER.info(
+            "PreCreateDialogスレッド開始直後: dialog_id=%s thread_id=%s isRunning=%s",
+            dialog_id,
+            thread_id,
+            self.thread.isRunning(),
+        )
 
     def set_running(self, running: bool) -> None:
+        APP_LOGGER.info(
+            "PreCreateDialog.set_running: dialog_id=%s old=%s new=%s",
+            id(self),
+            self.running,
+            running,
+        )
         self.running = running
         for widget in (
             self.pose_combo, self.effect_combo, self.confidence_spin, self.intensity_spin,
@@ -684,16 +798,36 @@ class PreCreateDialog(QDialog):
             self.update_frame_enabled()
 
     def update_progress(self, current: int, total: int, elapsed: float) -> None:
+        if current == 0 or current == total or current % 100 == 0:
+            APP_LOGGER.info(
+                "PreCreateDialog.update_progress: dialog_id=%s current=%s total=%s elapsed=%.3f",
+                id(self),
+                current,
+                total,
+                elapsed,
+            )
         self.progress_bar.setMaximum(max(1, total))
         self.progress_bar.setValue(current)
         self.progress_label.setText(progress_text(current, total, elapsed))
 
     def pre_finished(self, csv_path: str) -> None:
+        APP_LOGGER.info(
+            "PreCreateDialog.pre_finished: dialog_id=%s csv=%s thread=%s",
+            id(self),
+            csv_path,
+            id(self.thread) if self.thread is not None else None,
+        )
         self.result_csv = Path(csv_path)
         self.progress_label.setText(f"完了: {csv_path}")
         log_user_action("レシピ生成完了", csv_path=csv_path)
 
     def pre_failed(self, message: str) -> None:
+        APP_LOGGER.info(
+            "PreCreateDialog.pre_failed: dialog_id=%s message=%s thread=%s",
+            id(self),
+            message,
+            id(self.thread) if self.thread is not None else None,
+        )
         self.worker_failed = True
         self.set_running(False)
         if "キャンセル" in message:
@@ -706,11 +840,28 @@ class PreCreateDialog(QDialog):
             self.progress_label.setText("失敗")
 
     def pre_thread_finished(self) -> None:
+        APP_LOGGER.info(
+            "PreCreateDialog.pre_thread_finished開始: dialog_id=%s running=%s worker_failed=%s result_csv=%s thread=%s",
+            id(self),
+            self.running,
+            self.worker_failed,
+            self.result_csv,
+            id(self.thread) if self.thread is not None else None,
+        )
         self.running = False
         if self.result_csv is not None and not self.worker_failed:
+            APP_LOGGER.info("PreCreateDialog.accept呼び出し: dialog_id=%s", id(self))
             self.accept()
+        APP_LOGGER.info("PreCreateDialog.pre_thread_finished終了: dialog_id=%s", id(self))
 
     def cancel_or_reject(self) -> None:
+        APP_LOGGER.info(
+            "PreCreateDialog.cancel_or_reject: dialog_id=%s running=%s worker=%s thread=%s",
+            id(self),
+            self.running,
+            id(self.worker) if self.worker is not None else None,
+            id(self.thread) if self.thread is not None else None,
+        )
         if self.running:
             log_user_action("レシピ生成キャンセル要求")
             if self.worker:
@@ -722,17 +873,27 @@ class PreCreateDialog(QDialog):
         self.reject()
 
     def reject(self) -> None:
+        APP_LOGGER.info("PreCreateDialog.reject: dialog_id=%s running=%s", id(self), self.running)
         if self.running:
             self.cancel_or_reject()
             return
         super().reject()
 
     def closeEvent(self, event) -> None:
+        APP_LOGGER.info("PreCreateDialog.closeEvent: dialog_id=%s running=%s", id(self), self.running)
         if self.running:
             self.cancel_or_reject()
             event.ignore()
             return
         super().closeEvent(event)
+
+    def accept(self) -> None:
+        APP_LOGGER.info("PreCreateDialog.accept: dialog_id=%s running=%s result_csv=%s", id(self), self.running, self.result_csv)
+        super().accept()
+
+    def done(self, result: int) -> None:
+        APP_LOGGER.info("PreCreateDialog.done: dialog_id=%s result=%s running=%s", id(self), result, self.running)
+        super().done(result)
 
 
 class PostProgressDialog(QDialog):
