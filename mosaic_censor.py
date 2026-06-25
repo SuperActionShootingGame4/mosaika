@@ -63,6 +63,8 @@ YOLO_LABEL_SHORT: dict[str, str] = {
 POSE_BACKENDS = ("yolo11", "yolo8", "vitpose-h", "rtmpose", "rtmpose-wholebody")
 CENSOR_EFFECTS = ("mosaic", "blur")
 MAX_CSV_MOSAICS = 255
+PERSON_SKIP_CONFIDENCE = 0.25
+PERSON_SKIP_IMAGE_SIZE = 320
 
 
 def get_base_dir() -> Path:
@@ -272,6 +274,22 @@ def get_crotch_boxes(
         return _get_crotch_boxes_rtmpose(frame, pose_model_bundle[1])
     else:  # vitpose
         return _get_crotch_boxes_vitpose(frame, *pose_model_bundle[1:])
+
+
+def frame_has_person(frame: np.ndarray, person_detector) -> bool:
+    """Return True when a lightweight person detector sees at least one person."""
+    results = person_detector(
+        frame,
+        verbose=False,
+        device="cpu",
+        classes=[0],
+        conf=PERSON_SKIP_CONFIDENCE,
+        imgsz=PERSON_SKIP_IMAGE_SIZE,
+    )
+    for result in results:
+        if result.boxes is not None and len(result.boxes) > 0:
+            return True
+    return False
 
 
 def detect_genitalia_multicrop(
@@ -709,7 +727,7 @@ def merge_audio_ranges_from_source(
 
 
 def mosaic_csv_header() -> list[str]:
-    header = ["frame_no", "nsfw_detection_count", "crotch_detected", "comment"]
+    header = ["frame_no", "person_count", "nsfw_detection_count", "crotch_detected", "comment"]
     for i in range(1, MAX_CSV_MOSAICS + 1):
         header.extend([
             f"mosaic{i}_on",
@@ -731,9 +749,11 @@ def mosaic_csv_row(
     crotch_boxes: list[tuple[int, int, int, int]],
     nsfw_detection_count: int = 0,
     detector_boxes: list[tuple[tuple[int, int, int, int], float, str]] | None = None,
+    person_count: int = 0,
 ) -> dict[str, str | int]:
     row: dict[str, str | int] = {
         "frame_no": frame_idx,
+        "person_count": person_count,
         "nsfw_detection_count": nsfw_detection_count,
         "crotch_detected": "1" if crotch_boxes else "0",
         "comment": "",
@@ -768,6 +788,92 @@ def mosaic_csv_row(
         row[f"mosaic{i}_x2"] = box[2]
         row[f"mosaic{i}_y2"] = box[3]
     return row
+
+
+def write_pre_csv_meta(
+    csv_file,
+    input_path: str,
+    intensity: int,
+    effect: str,
+    confidence: float,
+    pose_backend: str,
+    yolo_nsfw_model_path: str | None,
+    yolo_confidence: float | None,
+    detect_every: int,
+    max_interpolate_gap: int,
+    no_crotch: bool,
+    skip_no_person: bool,
+) -> None:
+    meta = csv.writer(csv_file)
+    meta.writerow(["source_video", str(Path(input_path).resolve())])
+    meta.writerow(["intensity", intensity])
+    meta.writerow(["effect", effect])
+    meta.writerow(["confidence", confidence])
+    meta.writerow(["pose_model", pose_backend])
+    meta.writerow(["yolo_nsfw_model", yolo_nsfw_model_path or ""])
+    meta.writerow(["yolo_confidence", yolo_confidence])
+    meta.writerow(["detect_every", detect_every])
+    meta.writerow(["interpolate_gap", max_interpolate_gap])
+    meta.writerow(["no_crotch", int(no_crotch)])
+    meta.writerow(["skip_no_person", int(skip_no_person)])
+
+
+def create_blank_pre_csv(
+    input_path: str,
+    csv_path: str,
+    intensity: int,
+    effect: str,
+    confidence: float,
+    detect_every: int,
+    yolo_nsfw_model_path: str | None = None,
+    yolo_confidence: float | None = None,
+    max_interpolate_gap: int = 10,
+    frame_range: tuple[int, int] | None = None,
+    pose_backend: str = "yolo11",
+    no_crotch: bool = False,
+    skip_no_person: bool = False,
+    progress_callback=None,
+) -> None:
+    cap = cv2.VideoCapture(input_path)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"動画を開けません: {input_path}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        cap.release()
+
+    start_frame = 0
+    end_frame = max(0, total_frames - 1)
+    if frame_range is not None:
+        start_frame, end_frame = frame_range
+        if start_frame < 0 or end_frame < start_frame:
+            raise RuntimeError(f"フレーム範囲が不正です: {start_frame}-{end_frame}")
+        if start_frame >= total_frames:
+            raise RuntimeError(f"開始フレームが動画の総フレーム数を超えています: {start_frame} >= {total_frames}")
+        end_frame = min(end_frame, total_frames - 1)
+
+    process_frames = end_frame - start_frame + 1
+    with open(csv_path, "w", encoding="utf-8", newline="") as csv_file:
+        write_pre_csv_meta(
+            csv_file,
+            input_path,
+            intensity,
+            effect,
+            confidence,
+            pose_backend,
+            yolo_nsfw_model_path,
+            yolo_confidence,
+            detect_every,
+            max_interpolate_gap,
+            no_crotch,
+            skip_no_person,
+        )
+        writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header())
+        writer.writeheader()
+        for index, frame_idx in enumerate(range(start_frame, end_frame + 1), start=1):
+            writer.writerow(mosaic_csv_row(frame_idx, [], []))
+            if progress_callback:
+                progress_callback(index, process_frames, 0.0)
 
 
 def csv_on(value: str | None) -> bool:
@@ -886,6 +992,13 @@ def process_video(
                             providers=["CPUExecutionProvider"])
     _log(f"ポーズモデル: {pose_backend}")
     pose_model_bundle = load_pose_model(pose_backend)
+    person_detector = None
+    if skip_no_person:
+        _log(
+            f"人物なしスキップ用モデル: yolo11n.pt "
+            f"(conf={PERSON_SKIP_CONFIDENCE}, imgsz={PERSON_SKIP_IMAGE_SIZE})"
+        )
+        person_detector = YOLO("yolo11n.pt", task="detect")
     yolo_nsfw_model = None
     yolo_source = "YOLO"
     if yolo_nsfw_model_path:
@@ -940,18 +1053,20 @@ def process_video(
     resolved_input_path = str(Path(input_path).resolve())
     if csv_path:
         csv_file = open(csv_path, "w", encoding="utf-8", newline="")
-        meta = csv.writer(csv_file)
-        meta.writerow(["source_video",    resolved_input_path])
-        meta.writerow(["intensity",       intensity])
-        meta.writerow(["effect",          effect])
-        meta.writerow(["confidence",      confidence])
-        meta.writerow(["pose_model",      pose_backend])
-        meta.writerow(["yolo_nsfw_model", yolo_nsfw_model_path or ""])
-        meta.writerow(["yolo_confidence", yolo_confidence])
-        meta.writerow(["detect_every",    detect_every])
-        meta.writerow(["interpolate_gap", max_interpolate_gap])
-        meta.writerow(["no_crotch",        int(no_crotch)])
-        meta.writerow(["skip_no_person",   int(skip_no_person)])
+        write_pre_csv_meta(
+            csv_file,
+            resolved_input_path,
+            intensity,
+            effect,
+            confidence,
+            pose_backend,
+            yolo_nsfw_model_path,
+            yolo_confidence,
+            detect_every,
+            max_interpolate_gap,
+            no_crotch,
+            skip_no_person,
+        )
         csv_writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header())
         csv_writer.writeheader()
 
@@ -967,7 +1082,12 @@ def process_video(
     ) -> None:
         if csv_writer:
             csv_writer.writerow(mosaic_csv_row(
-                fidx, apply_bxs, srch_bxs, nsfw_detection_count, nnet_bxs
+                fidx,
+                apply_bxs,
+                srch_bxs,
+                nsfw_detection_count,
+                nnet_bxs,
+                person_count=len(pose_res),
             ))
         if writer is None and debug_writer is None:
             return
@@ -1058,49 +1178,60 @@ def process_video(
                         break
 
                     if (frame_idx - start_frame) % detect_every == 0:
-                        # Step 1: Pose で股間エリアを特定
-                        search_boxes, pose_kps = get_crotch_boxes(frame, pose_model_bundle)
-                        if skip_no_person and not pose_kps:
+                        if skip_no_person and person_detector is not None and not frame_has_person(frame, person_detector):
+                            search_boxes = []
+                            pose_kps = []
                             all_nudenet_boxes = []
                             yolo_boxes = []
                             all_detector_boxes = []
                             nudenet_boxes_conf = []
                             yolo_boxes_conf = []
                             new_boxes = []
-                            _log(f"frame {frame_idx}: no person detected, skipped NudeNet/YOLO")
+                            _log(f"frame {frame_idx}: no person detected by fast detector, skipped Pose/NudeNet/YOLO")
                         else:
-                            # Step 2: NudeNet で全体画像から全検出（0.01以上）を取得
-                            all_nudenet_boxes = detect_genitalia_multicrop(
-                                detector, frame, tmp_frame_path, 0.01
-                            )
-                            yolo_boxes = detect_yolo_genitalia_multicrop(
-                                yolo_nsfw_model, frame, yolo_confidence, yolo_source
-                            )
-                            all_detector_boxes = all_nudenet_boxes + yolo_boxes
-                            # Step 3: confidence 閾値でフィルタしてから crotch フィルタ適用
-                            nudenet_boxes_conf = [
-                                (box, score, label) for box, score, label in all_nudenet_boxes
-                                if score >= confidence
-                            ]
-                            yolo_boxes_conf = [
-                                (box, score, label) for box, score, label in yolo_boxes
-                                if score >= yolo_confidence
-                            ]
-                            nudenet_adopted = [
-                                (box, f"NudeNet {short_label}")
-                                for box, short_label in filter_by_crotch(
-                                    nudenet_boxes_conf, search_boxes, enabled=not no_crotch
+                            # Step 1: Pose で股間エリアを特定
+                            search_boxes, pose_kps = get_crotch_boxes(frame, pose_model_bundle)
+                            if skip_no_person and not pose_kps:
+                                all_nudenet_boxes = []
+                                yolo_boxes = []
+                                all_detector_boxes = []
+                                nudenet_boxes_conf = []
+                                yolo_boxes_conf = []
+                                new_boxes = []
+                                _log(f"frame {frame_idx}: no person detected by pose, skipped NudeNet/YOLO")
+                            else:
+                                # Step 2: NudeNet で全体画像から全検出（0.01以上）を取得
+                                all_nudenet_boxes = detect_genitalia_multicrop(
+                                    detector, frame, tmp_frame_path, 0.01
                                 )
-                            ]
-                            yolo_adopted = [
-                                (box, short_label)
-                                for box, short_label in filter_by_crotch(
-                                    yolo_boxes_conf, search_boxes, enabled=not no_crotch
+                                yolo_boxes = detect_yolo_genitalia_multicrop(
+                                    yolo_nsfw_model, frame, yolo_confidence, yolo_source
                                 )
-                            ]
-                            new_boxes = merge_adopted_boxes(
-                                nudenet_adopted + yolo_adopted
-                            )
+                                all_detector_boxes = all_nudenet_boxes + yolo_boxes
+                                # Step 3: confidence 閾値でフィルタしてから crotch フィルタ適用
+                                nudenet_boxes_conf = [
+                                    (box, score, label) for box, score, label in all_nudenet_boxes
+                                    if score >= confidence
+                                ]
+                                yolo_boxes_conf = [
+                                    (box, score, label) for box, score, label in yolo_boxes
+                                    if score >= yolo_confidence
+                                ]
+                                nudenet_adopted = [
+                                    (box, f"NudeNet {short_label}")
+                                    for box, short_label in filter_by_crotch(
+                                        nudenet_boxes_conf, search_boxes, enabled=not no_crotch
+                                    )
+                                ]
+                                yolo_adopted = [
+                                    (box, short_label)
+                                    for box, short_label in filter_by_crotch(
+                                        yolo_boxes_conf, search_boxes, enabled=not no_crotch
+                                    )
+                                ]
+                                new_boxes = merge_adopted_boxes(
+                                    nudenet_adopted + yolo_adopted
+                                )
 
                         last_boxes = new_boxes
                         last_search_boxes = search_boxes

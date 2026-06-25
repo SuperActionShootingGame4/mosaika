@@ -63,6 +63,7 @@ from mosaic_censor import (
     CENSOR_EFFECTS,
     POSE_BACKENDS,
     SKELETON_EDGES,
+    create_blank_pre_csv,
     effective_yolo_confidence,
     frame_in_ranges,
     get_crotch_boxes,
@@ -296,6 +297,7 @@ def save_recipe_config(settings: dict) -> None:
         f"yolo_confidence = {toml_value(settings['yolo_confidence'])}",
         f"no_crotch = {toml_value(settings['no_crotch'])}",
         f"skip_no_person = {toml_value(settings['skip_no_person'])}",
+        f"blank_recipe = {toml_value(settings['blank_recipe'])}",
         "",
     ]
     CONFIG_PATH.write_text("\n".join(lines), encoding="utf-8")
@@ -388,28 +390,47 @@ class PreCreateWorker(QObject):
                     self.options["yolo_nsfw_model"],
                     self.options["yolo_confidence"],
                 )
-                process_video(
-                    input_path=str(self.video_path),
-                    output_path=None,
-                    intensity=self.options["intensity"],
-                    effect=self.options["effect"],
-                    confidence=self.options["confidence"],
-                    detect_every=self.options["detect_every"],
-                    log_file=lf,
-                    debug_path=None,
-                    interpolate=True,
-                    yolo_nsfw_model_path=self.options["yolo_nsfw_model"],
-                    yolo_confidence=yolo_confidence,
-                    max_interpolate_gap=self.options["interpolate_gap"],
-                    frame_range=self.options["frame_range"],
-                    pose_backend=self.options["pose_model"],
-                    no_crotch=self.options["no_crotch"],
-                    csv_path=str(self.csv_path),
-                    render_debug_to_output=False,
-                    csv_only=True,
-                    progress_callback=self.emit_progress,
-                    skip_no_person=self.options["skip_no_person"],
-                )
+                if self.options["blank_recipe"]:
+                    lf.write("空レシピを生成します。\n")
+                    create_blank_pre_csv(
+                        input_path=str(self.video_path),
+                        csv_path=str(self.csv_path),
+                        intensity=self.options["intensity"],
+                        effect=self.options["effect"],
+                        confidence=self.options["confidence"],
+                        detect_every=self.options["detect_every"],
+                        yolo_nsfw_model_path=self.options["yolo_nsfw_model"],
+                        yolo_confidence=yolo_confidence,
+                        max_interpolate_gap=self.options["interpolate_gap"],
+                        frame_range=self.options["frame_range"],
+                        pose_backend=self.options["pose_model"],
+                        no_crotch=self.options["no_crotch"],
+                        skip_no_person=self.options["skip_no_person"],
+                        progress_callback=self.emit_progress,
+                    )
+                else:
+                    process_video(
+                        input_path=str(self.video_path),
+                        output_path=None,
+                        intensity=self.options["intensity"],
+                        effect=self.options["effect"],
+                        confidence=self.options["confidence"],
+                        detect_every=self.options["detect_every"],
+                        log_file=lf,
+                        debug_path=None,
+                        interpolate=True,
+                        yolo_nsfw_model_path=self.options["yolo_nsfw_model"],
+                        yolo_confidence=yolo_confidence,
+                        max_interpolate_gap=self.options["interpolate_gap"],
+                        frame_range=self.options["frame_range"],
+                        pose_backend=self.options["pose_model"],
+                        no_crotch=self.options["no_crotch"],
+                        csv_path=str(self.csv_path),
+                        render_debug_to_output=False,
+                        csv_only=True,
+                        progress_callback=self.emit_progress,
+                        skip_no_person=self.options["skip_no_person"],
+                    )
             APP_LOGGER.info("PreCreateWorker.run完了: worker_id=%s csv=%s", id(self), self.csv_path)
             self.finished.emit(str(self.csv_path))
             APP_LOGGER.info("PreCreateWorker.finished emit済み: worker_id=%s", id(self))
@@ -545,6 +566,8 @@ class PreCreateDialog(QDialog):
         self.no_crotch_check.setChecked(config_bool(self.config, "no_crotch", False))
         self.skip_no_person_check = QCheckBox("人物がいないフレームは検出をスキップ")
         self.skip_no_person_check.setChecked(config_bool(self.config, "skip_no_person", False))
+        self.blank_recipe_check = QCheckBox("空レシピを生成")
+        self.blank_recipe_check.setChecked(config_bool(self.config, "blank_recipe", False))
         self.all_frames_check = QCheckBox("全フレーム")
         self.all_frames_check.setChecked(config_bool(self.config, "all_frames", True))
         self.start_spin = QSpinBox()
@@ -586,6 +609,7 @@ class PreCreateDialog(QDialog):
         form.addRow("yolo_confidence", self.yolo_confidence_spin)
         form.addRow("", self.no_crotch_check)
         form.addRow("", self.skip_no_person_check)
+        form.addRow("", self.blank_recipe_check)
         layout.addLayout(form)
 
         self.progress_bar = QProgressBar()
@@ -649,15 +673,16 @@ class PreCreateDialog(QDialog):
         self.end_spin.setValue(max_frame)
         return True
 
-    def output_paths(self) -> tuple[Path, Path]:
+    def output_paths(self, blank_recipe: bool = False) -> tuple[Path, Path]:
         range_suffix = ""
         frame_range = self.frame_range()
         if frame_range is not None:
             range_suffix = f"_frames{frame_range[0]}-{frame_range[1]}"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         stem = self.video_path.stem
-        csv_path = self.video_path.with_name(f"{stem}{range_suffix}_pre_{stamp}.csv")
-        log_path = self.video_path.with_name(f"{stem}{range_suffix}_pre_{stamp}_log.txt")
+        kind = "blank_pre" if blank_recipe else "pre"
+        csv_path = self.video_path.with_name(f"{stem}{range_suffix}_{kind}_{stamp}.csv")
+        log_path = self.video_path.with_name(f"{stem}{range_suffix}_{kind}_{stamp}_log.txt")
         return csv_path, log_path
 
     def frame_range(self) -> tuple[int, int] | None:
@@ -681,6 +706,7 @@ class PreCreateDialog(QDialog):
             "yolo_confidence": self.yolo_confidence_spin.value(),
             "no_crotch": self.no_crotch_check.isChecked(),
             "skip_no_person": self.skip_no_person_check.isChecked(),
+            "blank_recipe": self.blank_recipe_check.isChecked(),
         }
 
     def start_pre_create(self) -> None:
@@ -709,7 +735,8 @@ class PreCreateDialog(QDialog):
             APP_LOGGER.exception("設定ファイルを書き込めません: %s", CONFIG_PATH)
             QMessageBox.critical(self, "Error", f"設定ファイルを書き込めません: {CONFIG_PATH}")
             return
-        csv_path, log_path = self.output_paths()
+        blank_recipe = self.blank_recipe_check.isChecked()
+        csv_path, log_path = self.output_paths(blank_recipe)
         yolo_model = self.yolo_model_input.text().strip() or None
         yolo_conf = None if self.yolo_confidence_spin.value() <= 0 else self.yolo_confidence_spin.value()
         options = {
@@ -724,6 +751,7 @@ class PreCreateDialog(QDialog):
             "yolo_nsfw_model": yolo_model,
             "yolo_confidence": yolo_conf,
             "skip_no_person": self.skip_no_person_check.isChecked(),
+            "blank_recipe": blank_recipe,
         }
         self.worker_failed = False
         self.result_csv = None
@@ -786,7 +814,8 @@ class PreCreateDialog(QDialog):
         for widget in (
             self.pose_combo, self.effect_combo, self.confidence_spin, self.intensity_spin,
             self.detect_every_spin, self.interpolate_gap_spin, self.no_crotch_check,
-            self.skip_no_person_check, self.all_frames_check, self.start_spin,
+            self.skip_no_person_check, self.blank_recipe_check,
+            self.all_frames_check, self.start_spin,
             self.end_spin, self.video_path_input, self.browse_video_button,
             self.yolo_model_input, self.yolo_confidence_spin, self.start_button,
         ):
@@ -1312,9 +1341,10 @@ class SequenceSlider(QSlider):
         super().__init__(Qt.Orientation.Horizontal)
         self.frame_numbers = frame_numbers
         self.keep_ranges: list[tuple[int, int]] = []
+        self.person_ranges: list[tuple[int, int, int]] = []
         self.keep_start_marker: int | None = None
         self.keep_end_marker: int | None = None
-        self.setMinimumHeight(42)
+        self.setMinimumHeight(56)
         self.setStyleSheet(
             """
             QSlider::groove:horizontal {
@@ -1332,6 +1362,10 @@ class SequenceSlider(QSlider):
 
     def set_keep_ranges(self, keep_ranges: list[tuple[int, int]]) -> None:
         self.keep_ranges = keep_ranges
+        self.update()
+
+    def set_person_ranges(self, person_ranges: list[tuple[int, int, int]]) -> None:
+        self.person_ranges = person_ranges
         self.update()
 
     def set_keep_markers(self, start_frame: int | None, end_frame: int | None) -> None:
@@ -1382,6 +1416,7 @@ class SequenceSlider(QSlider):
             elif x > self.width() - 40:
                 alignment = Qt.AlignmentFlag.AlignRight
             painter.drawText(label_x, 29, 80, 13, alignment, str(frame_no))
+        self.paint_person_ranges(painter, option, handle)
         self.paint_keep_markers(painter, option, handle)
 
     def paint_trim_ranges(self) -> None:
@@ -1466,6 +1501,37 @@ class SequenceSlider(QSlider):
             painter.drawLine(x, 14, x, 29)
             painter.setPen(color)
             painter.drawText(max(0, x - 8), 0, 16, 12, Qt.AlignmentFlag.AlignHCenter, label)
+
+    def paint_person_ranges(self, painter: QPainter, option: QStyleOptionSlider, handle: QRect) -> None:
+        if not self.frame_numbers or not self.person_ranges:
+            return
+        slider_max = max(1, self.width() - handle.width())
+        left_offset = handle.width() // 2
+
+        def frame_to_x(frame_no: int) -> int:
+            index = self.tick_index(frame_no)
+            position = QStyle.sliderPositionFromValue(
+                self.minimum(),
+                self.maximum(),
+                max(self.minimum(), min(self.maximum(), index)),
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+            return position + left_offset
+
+        color = QColor(20, 120, 70)
+        painter.setPen(QPen(color, 2))
+        y = 10
+        for start_frame, end_frame, person_count in self.person_ranges:
+            left = frame_to_x(start_frame)
+            right = frame_to_x(end_frame)
+            if right < left:
+                left, right = right, left
+            label = "P" if person_count == 1 else f"{person_count}P"
+            painter.drawText(max(0, left - 10), 0, 34, 10, Qt.AlignmentFlag.AlignLeft, label)
+            line_left = min(self.width() - 1, left + 14)
+            line_right = max(line_left + 8, right)
+            painter.drawLine(line_left, y, min(self.width() - 1, line_right), y)
 
     def mousePressEvent(self, event) -> None:
         option = QStyleOptionSlider()
@@ -1945,6 +2011,7 @@ class EditorWindow(QMainWindow):
         self.sequence_slider = SequenceSlider(frame_numbers)
         self.sequence_slider.setRange(0, max(0, len(self.data.rows) - 1))
         self.sequence_slider.set_keep_ranges(self.keep_ranges())
+        self.sequence_slider.set_person_ranges(self.person_ranges())
         left_layout.addWidget(self.sequence_slider)
 
         nav = QHBoxLayout()
@@ -2436,6 +2503,7 @@ class EditorWindow(QMainWindow):
             self.frame_table.blockSignals(False)
             if progress is not None:
                 progress.setValue(max(1, total))
+        self.sequence_slider.set_person_ranges(self.person_ranges())
 
     def row_modified(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.original_rows):
@@ -2447,6 +2515,41 @@ class EditorWindow(QMainWindow):
             return parse_frame_ranges(self.data.meta_dict.get("keep_ranges", ""))
         except ValueError:
             return []
+
+    def person_ranges(self) -> list[tuple[int, int, int]]:
+        ranges: list[tuple[int, int, int]] = []
+        current_start: int | None = None
+        current_end: int | None = None
+        current_count = 0
+        for row in self.data.rows:
+            try:
+                frame_no = int(row.get("frame_no", ""))
+                person_count = int(row.get("person_count", "0") or "0")
+            except ValueError:
+                continue
+            if person_count <= 0:
+                if current_start is not None and current_end is not None:
+                    ranges.append((current_start, current_end, current_count))
+                current_start = None
+                current_end = None
+                current_count = 0
+                continue
+            if (
+                current_start is not None
+                and current_end is not None
+                and current_count == person_count
+                and frame_no == current_end + 1
+            ):
+                current_end = frame_no
+                continue
+            if current_start is not None and current_end is not None:
+                ranges.append((current_start, current_end, current_count))
+            current_start = frame_no
+            current_end = frame_no
+            current_count = person_count
+        if current_start is not None and current_end is not None:
+            ranges.append((current_start, current_end, current_count))
+        return ranges
 
     def frame_is_kept(self, row: dict[str, str], keep_ranges: list[tuple[int, int]] | None = None) -> bool:
         try:
@@ -2498,6 +2601,9 @@ class EditorWindow(QMainWindow):
             self.frame_table.blockSignals(False)
 
     def person_count_for_row(self, row: dict[str, str]) -> str:
+        person_count = row.get("person_count")
+        if person_count not in (None, ""):
+            return person_count
         try:
             frame_no = int(row.get("frame_no", ""))
         except ValueError:
