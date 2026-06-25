@@ -1,109 +1,153 @@
 @echo off
-setlocal enabledelayedexpansion
-chcp 65001 > nul
+setlocal
 
-set SCRIPT_DIR=%~dp0
+set "SCRIPT_DIR=%~dp0"
 set "PYINSTALLER_UPX_DIR="
 set "SEVEN_ZIP="
 
-echo === Mosaika Windows ビルド ===
+echo === Mosaika Windows build ===
 echo.
 
-set PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe
+set "PYTHON=%SCRIPT_DIR%.venv\Scripts\python.exe"
 if not exist "%PYTHON%" (
-    echo .venv が見つかりません。作成します...
+    echo .venv not found. Creating virtual environment...
     python -m venv "%SCRIPT_DIR%.venv"
     if errorlevel 1 (
-        echo エラー: .venv の作成に失敗しました。
-        echo Python がインストールされ、PATH に登録されているか確認してください。
+        echo ERROR: Failed to create .venv.
+        echo Check that Python is installed and available on PATH.
         pause
         exit /b 1
     )
 )
 
-echo 依存関係を確認・インストール中...
+echo Checking and installing dependencies...
 "%PYTHON%" -m pip install --upgrade pip
-if errorlevel 1 ( echo pip の更新に失敗しました & pause & exit /b 1 )
+if errorlevel 1 (
+    echo ERROR: Failed to upgrade pip.
+    pause
+    exit /b 1
+)
 
 "%PYTHON%" -m pip install -r "%SCRIPT_DIR%requirements.txt"
-if errorlevel 1 ( echo requirements.txt のインストールに失敗しました & pause & exit /b 1 )
+if errorlevel 1 (
+    echo ERROR: Failed to install requirements.txt.
+    pause
+    exit /b 1
+)
 
 "%PYTHON%" -m pip install pyinstaller
-if errorlevel 1 ( echo pyinstaller のインストールに失敗しました & pause & exit /b 1 )
+if errorlevel 1 (
+    echo ERROR: Failed to install pyinstaller.
+    pause
+    exit /b 1
+)
 
-echo CPU 版 PyTorch をインストール中（CUDA 版は不要で巨大なため）...
+echo Installing CPU PyTorch...
 "%PYTHON%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --quiet
-if errorlevel 1 ( echo PyTorch のインストールに失敗しました & pause & exit /b 1 )
+if errorlevel 1 (
+    echo ERROR: Failed to install PyTorch.
+    pause
+    exit /b 1
+)
 
 "%PYTHON%" -m PyInstaller --version > nul 2>&1
 if errorlevel 1 (
-    echo PyInstaller が見つかりません。インストールします...
+    echo PyInstaller not found. Installing...
     "%PYTHON%" -m pip install pyinstaller
+    if errorlevel 1 (
+        echo ERROR: Failed to install PyInstaller.
+        pause
+        exit /b 1
+    )
 )
 
 if defined UPX_DIR (
     if exist "%UPX_DIR%\upx.exe" (
         set "PYINSTALLER_UPX_DIR=%UPX_DIR%"
-        echo UPX_DIR を使用します: %UPX_DIR%
+        echo Using UPX_DIR: %UPX_DIR%
     )
 )
+
 if defined PYINSTALLER_UPX_DIR (
-    echo UPX 圧縮を有効にします。
+    echo UPX compression enabled.
 ) else (
     where upx > nul 2>&1
     if errorlevel 1 (
-        echo UPX が見つかりません。UPX 圧縮なしでビルドします。
+        echo UPX not found. Building without UPX compression.
     ) else (
-        echo UPX が見つかりました。実行ファイルとDLLの圧縮を有効にします。
+        echo UPX found on PATH. PyInstaller may use UPX.
     )
 )
 
 if not exist "%SCRIPT_DIR%640m.onnx" (
-    echo エラー: 640m.onnx が見つかりません。
-    echo NudeNet のモデルファイルをスクリプトと同じフォルダに置いてください。
+    echo ERROR: 640m.onnx not found.
+    echo Put the NudeNet model file in the repository root.
     pause
     exit /b 1
 )
 
-echo [1/2] mosaika-editor ^(GUI^) をビルド中...
+echo [1/2] Building mosaika-editor GUI...
 if defined PYINSTALLER_UPX_DIR (
     "%PYTHON%" -m PyInstaller --noconfirm --clean --upx-dir "%PYINSTALLER_UPX_DIR%" "%SCRIPT_DIR%mosaika_editor.spec"
 ) else (
     "%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_editor.spec"
 )
-if errorlevel 1 ( echo ビルド失敗 & pause & exit /b 1 )
+if errorlevel 1 (
+    echo ERROR: mosaika-editor build failed.
+    pause
+    exit /b 1
+)
 
 echo.
-echo [2/2] mosaika-cli ^(CLI^) をビルド中...
+echo [2/2] Building mosaika-cli CLI...
 if defined PYINSTALLER_UPX_DIR (
     "%PYTHON%" -m PyInstaller --noconfirm --clean --upx-dir "%PYINSTALLER_UPX_DIR%" "%SCRIPT_DIR%mosaika_cli.spec"
 ) else (
     "%PYTHON%" -m PyInstaller --noconfirm --clean "%SCRIPT_DIR%mosaika_cli.spec"
 )
-if errorlevel 1 ( echo ビルド失敗 & pause & exit /b 1 )
+if errorlevel 1 (
+    echo ERROR: mosaika-cli build failed.
+    pause
+    exit /b 1
+)
 
 echo.
-echo dist\mosaika\ にまとめています...
+echo Combining into dist\mosaika...
 if exist "%SCRIPT_DIR%dist\mosaika" rmdir /s /q "%SCRIPT_DIR%dist\mosaika"
 rename "%SCRIPT_DIR%dist\mosaika-editor" mosaika
+if errorlevel 1 (
+    echo ERROR: Failed to rename dist\mosaika-editor.
+    pause
+    exit /b 1
+)
 copy "%SCRIPT_DIR%dist\mosaika-cli\mosaika-cli.exe" "%SCRIPT_DIR%dist\mosaika\" > nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy mosaika-cli.exe.
+    pause
+    exit /b 1
+)
 copy "%SCRIPT_DIR%640m.onnx" "%SCRIPT_DIR%dist\mosaika\" > nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy 640m.onnx.
+    pause
+    exit /b 1
+)
 
 echo.
-echo 配布アーカイブを作成中...
+echo Creating distribution archive...
 if exist "%SCRIPT_DIR%dist\mosaika.7z" del "%SCRIPT_DIR%dist\mosaika.7z"
 for /f "delims=" %%i in ('where 7z 2^>nul') do if not defined SEVEN_ZIP set "SEVEN_ZIP=%%i"
 if not defined SEVEN_ZIP if exist "%ProgramFiles%\7-Zip\7z.exe" set "SEVEN_ZIP=%ProgramFiles%\7-Zip\7z.exe"
 if not defined SEVEN_ZIP if exist "%ProgramFiles(x86)%\7-Zip\7z.exe" set "SEVEN_ZIP=%ProgramFiles(x86)%\7-Zip\7z.exe"
 if not defined SEVEN_ZIP (
-    echo 7z が見つかりません。アーカイブ作成をスキップします。
-    echo 7-Zip をインストールして PATH に追加すると dist\mosaika.7z を作成できます。
+    echo 7z not found. Skipping archive creation.
+    echo Install 7-Zip and add it to PATH to create dist\mosaika.7z.
 ) else (
     pushd "%SCRIPT_DIR%dist"
     "%SEVEN_ZIP%" a -t7z -mx=9 -m0=lzma2 -ms=on "mosaika.7z" "mosaika\"
     if errorlevel 1 (
         popd
-        echo 7z アーカイブの作成に失敗しました。
+        echo ERROR: Failed to create 7z archive.
         pause
         exit /b 1
     )
@@ -111,15 +155,15 @@ if not defined SEVEN_ZIP (
 )
 
 echo.
-echo === ビルド完了 ===
+echo === Build complete ===
 echo.
-echo 出力先: dist\mosaika\
-if exist "%SCRIPT_DIR%dist\mosaika.7z" echo 配布用: dist\mosaika.7z
-echo   mosaika-editor.exe  ... GUI エディタ
-echo   mosaika-cli.exe     ... CLI ツール
+echo Output: dist\mosaika\
+if exist "%SCRIPT_DIR%dist\mosaika.7z" echo Archive: dist\mosaika.7z
+echo   mosaika-editor.exe ... GUI editor
+echo   mosaika-cli.exe    ... CLI tool
 echo.
-echo 注意:
-echo   - ffmpeg を PATH に通すか dist\mosaika\ に ffmpeg.exe を置いてください
-echo   - YOLO モデルは初回実行時に自動ダウンロードされます
+echo Notes:
+echo   - Put ffmpeg on PATH or place ffmpeg.exe in dist\mosaika\
+echo   - YOLO model is downloaded automatically on first run
 echo.
 pause

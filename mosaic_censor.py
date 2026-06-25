@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -84,13 +85,11 @@ def load_pose_model(backend: str):
         try:
             from transformers import VitPoseForPoseEstimation, VitPoseImageProcessor
             import torch
-        except ImportError:
-            print(
-                "エラー: ViTPose-H には transformers が必要です。\n"
-                "  pip install transformers",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        except ImportError as exc:
+            raise RuntimeError(
+                "ViTPose-H には transformers が必要です。\n"
+                "  pip install transformers"
+            ) from exc
         from ultralytics import YOLO
         person_detector = YOLO("yolo11n.pt", task="detect")
         model_id = "nielsr/vitpose-base-simple"
@@ -103,13 +102,11 @@ def load_pose_model(backend: str):
     elif backend in ("rtmpose", "rtmpose-wholebody"):
         try:
             from rtmlib import Body, Wholebody
-        except ImportError:
-            print(
-                "エラー: RTMPose には rtmlib が必要です。\n"
-                "  pip install rtmlib",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        except ImportError as exc:
+            raise RuntimeError(
+                "RTMPose には rtmlib が必要です。\n"
+                "  pip install rtmlib"
+            ) from exc
         if backend == "rtmpose":
             model = Body(to_openpose=False, backend="onnxruntime", device="cpu")
         else:
@@ -875,15 +872,13 @@ def process_video(
 
     try:
         from nudenet import NudeDetector
-    except ImportError:
-        print("エラー: nudenet がインストールされていません。", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as exc:
+        raise RuntimeError("nudenet がインストールされていません。") from exc
 
     try:
         from ultralytics import YOLO
-    except ImportError:
-        print("エラー: ultralytics がインストールされていません。", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as exc:
+        raise RuntimeError(f"ultralytics の読み込みに失敗しました: {exc}") from exc
 
     _log("モデル初期化中...")
     model_path = str(get_base_dir() / "640m.onnx")
@@ -1044,8 +1039,15 @@ def process_video(
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_frame_path = os.path.join(tmp_dir, "_crop.jpg")
             frame_idx = start_frame
+            processed_frames = 0
+            progress_started_at = time.monotonic()
 
-            with tqdm(total=process_frames, desc="フレーム処理", unit="frame") as pbar:
+            with tqdm(
+                total=process_frames,
+                desc="フレーム処理",
+                unit="frame",
+                disable=progress_callback is not None or sys.stderr is None,
+            ) as pbar:
                 while True:
                     if frame_idx > end_frame:
                         _flush_pending(force=True)
@@ -1141,9 +1143,14 @@ def process_video(
                                    last_nsfw_detection_count, frame_idx)
 
                     frame_idx += 1
+                    processed_frames += 1
                     pbar.update(1)
                     if progress_callback:
-                        progress_callback(pbar.n, process_frames, pbar.format_dict.get("elapsed", 0.0))
+                        progress_callback(
+                            processed_frames,
+                            process_frames,
+                            time.monotonic() - progress_started_at,
+                        )
     finally:
         cap.release()
         if writer:
@@ -1185,8 +1192,7 @@ def process_single_frame(
         from nudenet import NudeDetector
         from ultralytics import YOLO
     except ImportError as exc:
-        print(f"エラー: 必要なライブラリがインストールされていません: {exc}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"必要なライブラリがインストールされていません: {exc}") from exc
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -1386,7 +1392,14 @@ def process_post_from_csv(
 
     try:
         current_pos: int | None = None
-        with tqdm(total=len(frame_rows), desc="CSV清書", unit="frame") as pbar:
+        processed_rows = 0
+        progress_started_at = time.monotonic()
+        with tqdm(
+            total=len(frame_rows),
+            desc="CSV清書",
+            unit="frame",
+            disable=progress_callback is not None or sys.stderr is None,
+        ) as pbar:
             for row in frame_rows:
                 frame_idx = int(row["frame_no"])
                 if current_pos != frame_idx:
@@ -1399,9 +1412,14 @@ def process_post_from_csv(
                 for box in boxes_from_csv_row(row):
                     frame = apply_censor_effect(frame, *box, intensity, effect)
                 writer.write(frame)
+                processed_rows += 1
                 pbar.update(1)
                 if progress_callback:
-                    progress_callback(pbar.n, len(frame_rows), pbar.format_dict.get("elapsed", 0.0))
+                    progress_callback(
+                        processed_rows,
+                        len(frame_rows),
+                        time.monotonic() - progress_started_at,
+                    )
     finally:
         cap.release()
         writer.release()

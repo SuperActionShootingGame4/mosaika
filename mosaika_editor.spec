@@ -38,10 +38,8 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'tkinter', 'matplotlib', 'IPython', 'jupyter', 'notebook',
-        'pandas', 'tensorflow',
-        'torch.cuda', 'torch.distributed', 'torch.testing',
-        'torchaudio',
+        'IPython', 'jupyter', 'notebook',
+        'tensorflow',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
