@@ -693,28 +693,64 @@ def log(msg: str, log_file) -> None:
     print(msg, file=log_file, flush=True)
 
 
+def run_ffmpeg_with_progress(
+    cmd: list[str],
+    tmp_video_path: str,
+    progress_callback=None,
+    duration_sec: float | None = None,
+) -> None:
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stderr_chunks: list[str] = []
+    if process.stdout is not None:
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line.startswith("out_time_ms="):
+                continue
+            if progress_callback is None or not duration_sec or duration_sec <= 0:
+                continue
+            try:
+                out_time_sec = int(line.split("=", 1)[1]) / 1_000_000
+            except ValueError:
+                continue
+            progress_callback(min(1.0, max(0.0, out_time_sec / duration_sec)))
+    if process.stderr is not None:
+        stderr_chunks.append(process.stderr.read())
+    return_code = process.wait()
+    if progress_callback is not None:
+        progress_callback(1.0)
+    os.remove(tmp_video_path)
+    if return_code != 0:
+        raise RuntimeError(f"FFmpeg エラー:\n{''.join(stderr_chunks)}")
+
+
 def merge_audio_from_source(
     source_video_path: str,
     tmp_video_path: str,
     output_path: str,
     start_frame: int,
     fps: float,
+    progress_callback=None,
+    duration_sec: float | None = None,
 ) -> None:
     input_args = ["-i", source_video_path]
     if start_frame:
         input_args = ["-ss", f"{start_frame / fps:.6f}", "-i", source_video_path]
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
         "-i", tmp_video_path, *input_args,
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
         "-c:a", "aac", "-b:a", "192k",
         "-map", "0:v:0", "-map", "1:a:0?", "-shortest",
         output_path,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    os.remove(tmp_video_path)
-    if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg エラー:\n{r.stderr}")
+    run_ffmpeg_with_progress(cmd, tmp_video_path, progress_callback, duration_sec)
 
 
 def source_has_audio(source_video_path: str) -> bool:
@@ -728,18 +764,20 @@ def source_has_audio(source_video_path: str) -> bool:
     return bool(r.stdout.strip())
 
 
-def encode_video_without_audio(tmp_video_path: str, output_path: str) -> None:
+def encode_video_without_audio(
+    tmp_video_path: str,
+    output_path: str,
+    progress_callback=None,
+    duration_sec: float | None = None,
+) -> None:
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
         "-i", tmp_video_path,
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
         "-an",
         output_path,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    os.remove(tmp_video_path)
-    if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg エラー:\n{r.stderr}")
+    run_ffmpeg_with_progress(cmd, tmp_video_path, progress_callback, duration_sec)
 
 
 def merge_audio_ranges_from_source(
@@ -748,11 +786,13 @@ def merge_audio_ranges_from_source(
     output_path: str,
     keep_ranges: list[tuple[int, int]],
     fps: float,
+    progress_callback=None,
+    duration_sec: float | None = None,
 ) -> None:
     if not keep_ranges:
         raise RuntimeError("音声マージ用の残す範囲がありません")
     if not source_has_audio(source_video_path):
-        encode_video_without_audio(tmp_video_path, output_path)
+        encode_video_without_audio(tmp_video_path, output_path, progress_callback, duration_sec)
         return
     parts: list[str] = []
     labels: list[str] = []
@@ -766,7 +806,7 @@ def merge_audio_ranges_from_source(
         labels.append(f"[a{idx}]")
     parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[aout]")
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
         "-i", tmp_video_path, "-i", source_video_path,
         "-filter_complex", ";".join(parts),
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
@@ -774,10 +814,7 @@ def merge_audio_ranges_from_source(
         "-map", "0:v:0", "-map", "[aout]", "-shortest",
         output_path,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    os.remove(tmp_video_path)
-    if r.returncode != 0:
-        raise RuntimeError(f"FFmpeg エラー:\n{r.stderr}")
+    run_ffmpeg_with_progress(cmd, tmp_video_path, progress_callback, duration_sec)
 
 
 def mosaic_csv_header() -> list[str]:
@@ -1593,13 +1630,15 @@ def process_post_from_csv(
     writer = cv2.VideoWriter(
         tmp_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
     )
+    frame_total = len(frame_rows)
+    total_progress_units = max(1, frame_total * 2)
+    progress_started_at = time.monotonic()
 
     try:
         current_pos: int | None = None
         processed_rows = 0
-        progress_started_at = time.monotonic()
         with tqdm(
-            total=len(frame_rows),
+            total=frame_total,
             desc="CSV清書",
             unit="frame",
             disable=progress_callback is not None or sys.stderr is None,
@@ -1621,7 +1660,7 @@ def process_post_from_csv(
                 if progress_callback:
                     progress_callback(
                         processed_rows,
-                        len(frame_rows),
+                        total_progress_units,
                         time.monotonic() - progress_started_at,
                     )
     finally:
@@ -1629,10 +1668,41 @@ def process_post_from_csv(
         writer.release()
 
     _log("音声をマージ中...")
+    if progress_callback:
+        progress_callback(frame_total, total_progress_units, time.monotonic() - progress_started_at)
+
+    output_duration_sec = frame_total / fps if fps and fps > 0 else None
+
+    def merge_progress(progress: float) -> None:
+        if not progress_callback:
+            return
+        current = frame_total + round(frame_total * max(0.0, min(1.0, progress)))
+        progress_callback(
+            min(total_progress_units, current),
+            total_progress_units,
+            time.monotonic() - progress_started_at,
+        )
+
     if keep_ranges:
-        merge_audio_ranges_from_source(source_video, tmp_video_path, dst, audio_ranges, fps)
+        merge_audio_ranges_from_source(
+            source_video,
+            tmp_video_path,
+            dst,
+            audio_ranges,
+            fps,
+            progress_callback=merge_progress if progress_callback else None,
+            duration_sec=output_duration_sec,
+        )
     else:
-        merge_audio_from_source(source_video, tmp_video_path, dst, first_frame, fps)
+        merge_audio_from_source(
+            source_video,
+            tmp_video_path,
+            dst,
+            first_frame,
+            fps,
+            progress_callback=merge_progress if progress_callback else None,
+            duration_sec=output_duration_sec,
+        )
     _log(f"完了: {dst}")
 
 

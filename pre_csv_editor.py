@@ -85,6 +85,7 @@ MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
 TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
+FRAME_SLIDER_LOAD_DELAY_MS = 35
 
 APP_LOGGER = logging.getLogger("pre_csv_editor")
 APP_LOG_FILE_HANDLE = None
@@ -958,9 +959,25 @@ class PostProgressDialog(QDialog):
         layout.addWidget(self.label)
         layout.addWidget(self.progress_bar)
 
+    def set_stage_progress(self, message: str, current: int, total: int, started_at: float | None = None) -> None:
+        self.progress_bar.setMaximum(max(1, total))
+        self.progress_bar.setValue(current)
+        percent = int(current * 100 / max(1, total))
+        if started_at is None or current <= 0:
+            self.label.setText(f"{message} {percent}%")
+        else:
+            elapsed = time.monotonic() - started_at
+            remaining = elapsed * (total - current) / current
+            self.label.setText(
+                f"{message} {percent}%  残り "
+                f"{time.strftime('%H:%M:%S', time.gmtime(max(0, remaining)))}"
+            )
+        QApplication.processEvents()
+
     def start(self) -> None:
         self.running = True
         log_user_action("エンコードダイアログ開始", csv_path=self.csv_path, output_path=self.output_path)
+        self.set_stage_progress("エンコード準備中...", 0, 1)
         self.thread = QThread(self)
         self.worker = PostWorker(self.csv_path, self.output_path, self.log_path)
         self.worker.moveToThread(self.thread)
@@ -1373,6 +1390,8 @@ class SequenceSlider(QSlider):
         self.person_ranges: list[tuple[int, int, int]] = []
         self.keep_start_marker: int | None = None
         self.keep_end_marker: int | None = None
+        self.jump_dragging = False
+        self.setTracking(True)
         self.setMinimumHeight(56)
         self.setStyleSheet(
             """
@@ -1572,20 +1591,43 @@ class SequenceSlider(QSlider):
             self,
         )
         if event.button() == Qt.MouseButton.LeftButton and not handle.contains(event.position().toPoint()):
-            slider_max = max(0, self.width() - handle.width())
-            position = round(event.position().x() - handle.width() / 2)
-            self.setValue(
-                QStyle.sliderValueFromPosition(
-                    self.minimum(),
-                    self.maximum(),
-                    position,
-                    slider_max,
-                    upsideDown=option.upsideDown,
-                )
-            )
+            self.jump_dragging = True
+            self.set_value_from_mouse_x(event.position().x(), option, handle)
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.jump_dragging and event.buttons() & Qt.MouseButton.LeftButton:
+            option = QStyleOptionSlider()
+            self.initStyleOption(option)
+            handle = self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider,
+                option,
+                QStyle.SubControl.SC_SliderHandle,
+                self,
+            )
+            self.set_value_from_mouse_x(event.position().x(), option, handle)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.jump_dragging = False
+        super().mouseReleaseEvent(event)
+
+    def set_value_from_mouse_x(self, x: float, option: QStyleOptionSlider, handle: QRect) -> None:
+        slider_max = max(0, self.width() - handle.width())
+        position = round(x - handle.width() / 2)
+        self.setValue(
+            QStyle.sliderValueFromPosition(
+                self.minimum(),
+                self.maximum(),
+                position,
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+        )
 
 
 class CanvasScrollArea(QScrollArea):
@@ -1893,6 +1935,9 @@ class EditorWindow(QMainWindow):
         APP_LOGGER.info("CSV読込開始: %s", csv_path)
         if hasattr(self, "playback_active") and self.playback_active:
             self.stop_preview_playback()
+        if hasattr(self, "slider_load_timer"):
+            self.slider_load_timer.stop()
+            self.pending_slider_index = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
@@ -1930,6 +1975,10 @@ class EditorWindow(QMainWindow):
         self.display_cap_pos: int | None = None
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self.playback_next_frame)
+        self.slider_load_timer = QTimer(self)
+        self.slider_load_timer.setSingleShot(True)
+        self.slider_load_timer.timeout.connect(self.load_pending_slider_frame)
+        self.pending_slider_index: int | None = None
         self.playback_index: int | None = None
         self.playback_cap_pos: int | None = None
         self.playback_active = False
@@ -2309,6 +2358,7 @@ class EditorWindow(QMainWindow):
         QApplication.processEvents()
 
     def load_frame(self) -> None:
+        self.pending_slider_index = None
         frame_no_text = self.current_row().get("frame_no", "")
         try:
             frame_no = int(frame_no_text)
@@ -2335,6 +2385,30 @@ class EditorWindow(QMainWindow):
             self.populate_selected_from_nearest(on=False)
         self.select_current_frame_row()
         self.refresh_mosaic_table()
+
+    def update_frame_position_labels(self) -> None:
+        row = self.current_row()
+        self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}")
+        self.frame_input.setText(row.get("frame_no", ""))
+
+    def schedule_slider_frame_load(self, index: int) -> None:
+        if self.playback_active:
+            self.stop_preview_playback()
+        self.current_index = index
+        self.pending_slider_index = index
+        self.update_frame_position_labels()
+        self.slider_load_timer.start(FRAME_SLIDER_LOAD_DELAY_MS)
+
+    def load_pending_slider_frame(self) -> None:
+        if self.pending_slider_index is None:
+            return
+        target_index = self.pending_slider_index
+        self.pending_slider_index = None
+        if not (0 <= target_index < len(self.data.rows)):
+            return
+        if self.current_index != target_index:
+            self.current_index = target_index
+        self.load_frame()
 
     def read_frame_number(self, frame_no: int, prefer_sequential: bool) -> np.ndarray | None:
         if self.cap is None:
@@ -2883,7 +2957,7 @@ class EditorWindow(QMainWindow):
 
     def select_sequence_frame(self, index: int) -> None:
         if 0 <= index < len(self.data.rows) and index != self.current_index:
-            self.move_to_index(index)
+            self.schedule_slider_frame_load(index)
 
     def select_mosaic(self, row: int, col: int) -> None:
         header_item = self.mosaic_table.verticalHeaderItem(row)
@@ -3098,6 +3172,9 @@ class EditorWindow(QMainWindow):
     def move_to_index(self, target_index: int) -> None:
         if target_index == self.current_index:
             return
+        if hasattr(self, "slider_load_timer"):
+            self.slider_load_timer.stop()
+            self.pending_slider_index = None
         if self.playback_active:
             self.stop_preview_playback()
         self.current_index = target_index
@@ -3257,45 +3334,63 @@ class EditorWindow(QMainWindow):
             return
         APP_LOGGER.info("確認なし保存: csv=%s", self.csv_path)
         try:
-            self.save_current_recipe_with_progress("レシピを保存中...")
+            self.save_current_recipe_with_progress("レシピを保存中...", refresh_table=False)
         except Exception:
             APP_LOGGER.exception("確認なし保存失敗: csv=%s", self.csv_path)
             raise
 
-    def save_current_recipe_with_progress(self, message: str) -> None:
+    def save_current_recipe_with_progress(
+        self,
+        message: str,
+        progress_dialog: PostProgressDialog | None = None,
+        refresh_table: bool = True,
+    ) -> None:
         if self.csv_path is None:
             return
         total_rows = len(self.data.rows)
-        total_steps = max(1, total_rows * 2)
+        total_steps = max(1, total_rows * (2 if refresh_table else 1))
         started_at = time.monotonic()
-        progress = self.reusable_progress_dialog("保存中", message, total_steps)
+        progress = None
+        if progress_dialog is None:
+            progress = self.reusable_progress_dialog("保存中", message, total_steps)
+        else:
+            progress_dialog.set_stage_progress(message, 0, total_steps)
 
         def on_write_progress(current: int, total: int) -> None:
-            self.update_progress_dialog(
-                progress,
-                "CSVを書き込み中...",
-                min(total_steps, current),
-                total_steps,
-                started_at,
-            )
+            done = min(total_steps, current)
+            if progress_dialog is not None:
+                progress_dialog.set_stage_progress("CSVを書き込み中...", done, total_steps, started_at)
+            else:
+                self.update_progress_dialog(
+                    progress,
+                    "CSVを書き込み中...",
+                    done,
+                    total_steps,
+                    started_at,
+                )
 
         try:
             write_pre_csv(self.csv_path, self.data, progress_callback=on_write_progress)
             self.original_rows = [dict(row) for row in self.data.rows]
             self.dirty = False
             self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
-            self.populate_frame_table(
-                show_progress=True,
-                progress_message="画面を更新中...",
-                progress=progress,
-                progress_offset=total_rows,
-                progress_total=total_steps,
-            )
-            progress.setValue(total_steps)
-            progress.setLabelText("保存完了")
+            if refresh_table:
+                self.populate_frame_table(
+                    show_progress=True,
+                    progress_message="画面を更新中...",
+                    progress=progress,
+                    progress_offset=total_rows,
+                    progress_total=total_steps,
+                )
+            if progress_dialog is not None:
+                progress_dialog.set_stage_progress("保存完了", total_steps, total_steps)
+            else:
+                progress.setValue(total_steps)
+                progress.setLabelText("保存完了")
             QApplication.processEvents()
         finally:
-            progress.hide()
+            if progress is not None:
+                progress.hide()
 
     def encode_post(self) -> None:
         if self.csv_path is None:
@@ -3303,16 +3398,24 @@ class EditorWindow(QMainWindow):
             QMessageBox.information(self, "未選択", "レシピが開かれていません。")
             return
         log_user_action("エンコード開始要求", csv_path=self.csv_path)
-        try:
-            self.save_without_confirm()
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"保存に失敗したためエンコードできません: {exc}")
-            return
         output_path = post_output_path_from_csv(self.csv_path)
         log_path = output_path.with_name(f"{output_path.stem}_log.txt")
         self.encode_button.setEnabled(False)
         dialog = PostProgressDialog(self.csv_path, output_path, log_path, self)
         dialog.finished.connect(lambda _result: self.encode_button.setEnabled(True))
+        dialog.show()
+        dialog.set_stage_progress("エンコード前に保存中...", 0, max(1, len(self.data.rows)))
+        try:
+            self.save_current_recipe_with_progress(
+                "エンコード前に保存中...",
+                progress_dialog=dialog,
+                refresh_table=False,
+            )
+        except Exception as exc:
+            self.encode_button.setEnabled(True)
+            dialog.reject()
+            QMessageBox.critical(self, "Error", f"保存に失敗したためエンコードできません: {exc}")
+            return
         dialog.start()
         dialog.exec()
 
