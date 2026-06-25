@@ -42,9 +42,6 @@ jobs:
           .venv\Scripts\pip show PyQt6
           .venv\Scripts\python -c "from PyQt6.QtWidgets import QApplication; print('PyQt6 OK')"
 
-      - name: Show collect_all result for PyQt6 (debug)
-        run: .venv\Scripts\python ci_debug_pyqt6.py
-
       - name: Show installed packages (debug)
         run: .venv\Scripts\pip list
 
