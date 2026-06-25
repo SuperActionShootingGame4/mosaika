@@ -39,8 +39,14 @@ echo [1/2] mosaika-editor ^(GUI^) をビルド中...
 if errorlevel 1 ( echo ビルド失敗 & pause & exit /b 1 )
 
 echo PyQt6 を _internal\ にコピー中...
-for /f "delims=" %%i in ('"%PYTHON%" -c "import site; print(site.getsitepackages()[0])"') do set SITE=%%i
-xcopy /e /i /y "%SITE%\PyQt6" "%SCRIPT_DIR%dist\mosaika-editor\_internal\PyQt6" > nul
+for /f "delims=" %%i in ('"%PYTHON%" -c "import pathlib, PyQt6; print(pathlib.Path(PyQt6.__path__[0]))"') do set PYQT6=%%i
+if not exist "%PYQT6%" (
+    echo エラー: PyQt6 パッケージが見つかりません: %PYQT6%
+    pause
+    exit /b 1
+)
+if exist "%SCRIPT_DIR%dist\mosaika-editor\_internal\PyQt6" rmdir /s /q "%SCRIPT_DIR%dist\mosaika-editor\_internal\PyQt6"
+xcopy /e /i /y "%PYQT6%" "%SCRIPT_DIR%dist\mosaika-editor\_internal\PyQt6" > nul
 
 echo.
 echo [2/2] mosaika-cli ^(CLI^) をビルド中...
