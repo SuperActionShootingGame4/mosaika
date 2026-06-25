@@ -530,7 +530,7 @@ class PreCreateDialog(QDialog):
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.progress_label)
         self.buttons = QDialogButtonBox()
-        self.start_button = self.buttons.addButton("レシピ生成", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.start_button = self.buttons.addButton("レシピ生成", QDialogButtonBox.ButtonRole.ActionRole)
         self.cancel_button = self.buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
         layout.addWidget(self.buttons)
 
@@ -617,6 +617,8 @@ class PreCreateDialog(QDialog):
         }
 
     def start_pre_create(self) -> None:
+        if self.running:
+            return
         if not self.update_video_path_from_input():
             return
         frame_range = self.frame_range()
@@ -724,6 +726,13 @@ class PreCreateDialog(QDialog):
             self.cancel_or_reject()
             return
         super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self.running:
+            self.cancel_or_reject()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 class PostProgressDialog(QDialog):
