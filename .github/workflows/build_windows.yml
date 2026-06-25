@@ -42,6 +42,14 @@ jobs:
           .venv\Scripts\pip show PyQt6
           .venv\Scripts\python -c "from PyQt6.QtWidgets import QApplication; print('PyQt6 OK')"
 
+      - name: Read app version
+        shell: pwsh
+        run: |
+          $version = (& .venv\Scripts\python -c "from app_version import APP_VERSION; print(APP_VERSION)").Trim()
+          if (!$version) { Write-Error "APP_VERSION is empty"; exit 1 }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "APP_VERSION=$version"
+
       - name: Show installed packages (debug)
         run: .venv\Scripts\pip list
 
@@ -83,6 +91,6 @@ jobs:
       - name: Upload mosaika
         uses: actions/upload-artifact@v4
         with:
-          name: mosaika-windows
+          name: mosaika-windows-${{ env.APP_VERSION }}
           path: dist/mosaika/
           retention-days: 30

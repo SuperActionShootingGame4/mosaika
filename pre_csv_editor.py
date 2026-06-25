@@ -58,6 +58,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app_version import APP_VERSION
 from mosaic_censor import (
     CENSOR_EFFECTS,
     POSE_BACKENDS,
@@ -1904,6 +1905,9 @@ class EditorWindow(QMainWindow):
 
     def build_menu(self) -> None:
         menu = self.menuBar().addMenu("メニュー")
+        version_action = QAction(f"version {APP_VERSION}", self)
+        version_action.setEnabled(False)
+        self.menuBar().addAction(version_action)
 
         create_action = QAction("レシピ生成", self)
         create_action.triggered.connect(self.create_recipe_from_menu)
@@ -1923,6 +1927,13 @@ class EditorWindow(QMainWindow):
         encode_action.triggered.connect(self.encode_post)
         encode_action.setEnabled(self.csv_path is not None)
         menu.addAction(encode_action)
+
+        menu.addSeparator()
+
+        exit_action = QAction("終了", self)
+        exit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        exit_action.triggered.connect(self.close)
+        menu.addAction(exit_action)
 
     def create_recipe_from_menu(self) -> None:
         log_user_action("メニュー レシピ生成")
