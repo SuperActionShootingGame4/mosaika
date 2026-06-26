@@ -45,6 +45,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QProgressDialog,
@@ -2409,7 +2410,7 @@ class EditorWindow(QMainWindow):
         self.dirty = False
         self.editor_windows: list[EditorWindow] = []
         self.cap = None
-        self.setWindowTitle("pre CSV Editor")
+        self.setWindowTitle(f"saika ver.{APP_VERSION}")
         self.resize(1680, 980)
         if csv_path is None:
             self.build_empty_ui()
@@ -2503,7 +2504,7 @@ class EditorWindow(QMainWindow):
         self.playback_cap_pos: int | None = None
         self.playback_active = False
 
-        self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
+        self.setWindowTitle(f"saika ver.{APP_VERSION} - {csv_path.name}")
         set_load_progress("画面を構築中...", 82)
         self.build_ui(show_load_progress=True)
         set_load_progress("先頭フレームを読み込み中...", 96)
@@ -2720,10 +2721,10 @@ class EditorWindow(QMainWindow):
         right_layout.addWidget(self.frame_table, stretch=1)
 
         # モザイクマトリクスはフレーム行選択マトリクスのすぐ下に配置する。
-        self.mosaic_table = QTableWidget(1, 14)
+        self.mosaic_table = QTableWidget(1, 10)
         self.mosaic_table.setHorizontalHeaderLabels(
             [
-                "mosaic", "Trace", "T scale", "Start", "End", "type", "score",
+                "mosaic", "type", "score",
                 "w", "h", "x1", "y1", "x2", "y2", "comment",
             ]
         )
@@ -2768,6 +2769,8 @@ class EditorWindow(QMainWindow):
         self.csrt_trace_check.toggled.connect(self.update_csrt_trace)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
+        self.mosaic_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.mosaic_table.customContextMenuRequested.connect(self.show_mosaic_context_menu)
         self.frame_table.clicked.connect(self.select_frame_row)
         self.frame_table.selectionModel().selectionChanged.connect(self.select_selected_frame_row)
         self.populate_frame_table(
@@ -3515,10 +3518,6 @@ class EditorWindow(QMainWindow):
             rect = get_rect(row, slot)
             values = [
                 true_false(row.get(f"mosaic{slot}_on")),
-                "T" if slot in self.trace_slots else "F",
-                "T" if self.trace_scale_enabled(slot) else "F",
-                str(self.trace_range_for_slot(slot)[0]),
-                str(self.trace_range_for_slot(slot)[1]),
                 row.get(f"mosaic{slot}_type", ""),
                 row.get(f"mosaic{slot}_score", ""),
                 str(rect.width()) if rect is not None else "",
@@ -3531,7 +3530,7 @@ class EditorWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col in (0, 6, 7, 8):
+                if col in (0, 2, 3, 4):
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if slot == self.selected_slot:
                     item.setBackground(QColor(255, 245, 200))
@@ -3606,50 +3605,15 @@ class EditorWindow(QMainWindow):
         except ValueError:
             return
         col = item.column()
-        if col == 1:
-            if is_on(item.text()):
-                self.start_trace_with_length(slot, source="table")
-            else:
-                self.trace_slots.discard(slot)
-                self.auto_track_anchors.pop(slot, None)
-                self.selected_slot = slot
-                log_user_action("追跡解除", frame=self.current_frame_no(), slot=slot, source="table")
-                self.refresh_mosaic_table()
-            return
-        if col == 2:
-            if is_on(item.text()):
-                self.trace_scale_slots.add(slot)
-            else:
-                self.trace_scale_slots.discard(slot)
-            self.selected_slot = slot
-            log_user_action("追跡スケール設定変更", frame=self.current_frame_no(), slot=slot, enabled=slot in self.trace_scale_slots)
-            self.refresh_mosaic_table()
-            return
-        if col in (3, 4):
-            current_start, current_end = self.trace_range_for_slot(slot)
-            try:
-                value = int(item.text().strip())
-            except ValueError:
-                self.auto_track_status.setText(f"mosaic{slot}: Start/End は frame_no の数値で入力してください")
-                self.refresh_mosaic_table()
-                return
-            if col == 3:
-                self.trace_ranges[slot] = (value, current_end)
-            else:
-                self.trace_ranges[slot] = (current_start, value)
-            self.selected_slot = slot
-            log_user_action("追跡範囲変更", frame=self.current_frame_no(), slot=slot, start=self.trace_ranges[slot][0], end=self.trace_ranges[slot][1])
-            self.refresh_mosaic_table()
-            return
         keys = {
             0: f"mosaic{slot}_on",
-            5: f"mosaic{slot}_type",
-            9: f"mosaic{slot}_x1",
-            10: f"mosaic{slot}_y1",
-            11: f"mosaic{slot}_x2",
-            12: f"mosaic{slot}_y2",
+            1: f"mosaic{slot}_type",
+            5: f"mosaic{slot}_x1",
+            6: f"mosaic{slot}_y1",
+            7: f"mosaic{slot}_x2",
+            8: f"mosaic{slot}_y2",
         }
-        if col == 13:
+        if col == 9:
             self.current_row()["comment"] = item.text().strip()
             log_user_action("モザイクコメント変更", frame=self.current_frame_no(), slot=slot)
             self.mark_dirty()
@@ -3661,7 +3625,7 @@ class EditorWindow(QMainWindow):
             return
         value = true_false(item.text()) if col == 0 else item.text().strip()
         self.current_row()[key] = value
-        if col >= 9:
+        if col >= 5:
             self.current_row()[f"mosaic{slot}_score"] = ""
             set_blank_crotch(self.current_row(), slot)
         self.mark_dirty()
@@ -3715,27 +3679,30 @@ class EditorWindow(QMainWindow):
             log_user_action("モザイク有効切替", frames=rows, slot=slot, enabled=on)
             self.refresh_mosaic_table()
             return
-        if col == 1:
-            if self.selected_slot in self.trace_slots:
-                self.trace_slots.discard(self.selected_slot)
-                self.auto_track_anchors.pop(self.selected_slot, None)
-                log_user_action("追跡解除", frame=self.current_frame_no(), slot=self.selected_slot, source="click")
-                self.refresh_mosaic_table()
-            else:
-                self.start_trace_with_length(self.selected_slot, source="click")
-            return
-        if col == 2:
-            if self.selected_slot in self.trace_scale_slots:
-                self.trace_scale_slots.discard(self.selected_slot)
-            else:
-                self.trace_scale_slots.add(self.selected_slot)
-            log_user_action("追跡スケール設定変更", frame=self.current_frame_no(), slot=self.selected_slot, enabled=self.selected_slot in self.trace_scale_slots)
-            self.refresh_mosaic_table()
-            return
         selected_rect = get_rect(self.current_row(), self.selected_slot)
         if selected_rect is None:
             self.populate_selected_from_nearest(on=False)
         self.refresh_mosaic_table()
+
+    def show_mosaic_context_menu(self, pos) -> None:
+        """モザイクマトリクスの右クリックメニュー。トレースを起動する。"""
+        table_row = self.mosaic_table.rowAt(pos.y())
+        if table_row < 0:
+            return
+        header_item = self.mosaic_table.verticalHeaderItem(table_row)
+        if header_item is None:
+            return
+        try:
+            slot = int(header_item.text())
+        except ValueError:
+            return
+        self.selected_slot = slot
+        self.mosaic_table.selectRow(table_row)
+        menu = QMenu(self.mosaic_table)
+        trace_action = menu.addAction("トレース")
+        chosen = menu.exec(self.mosaic_table.viewport().mapToGlobal(pos))
+        if chosen is trace_action:
+            self.start_trace_with_length(slot, source="menu")
 
     def current_frame_no(self) -> int | None:
         try:
@@ -3760,22 +3727,37 @@ class EditorWindow(QMainWindow):
         default_length = 1
         if current_start == start_frame and current_end is not None:
             default_length = max(1, min(999999, int(current_end) - start_frame))
-        length, ok = QInputDialog.getInt(
-            self,
-            "トレース長さ",
-            (
-                f"mosaic{slot} を現在フレーム {start_frame} から何フレーム先までトレースしますか？\n"
-                "途中で動体検出を見失った場合は、そのフレームをTrace Endにして停止します。"
-            ),
-            default_length,
-            1,
-            999999,
-            1,
+        dialog = QDialog(self)
+        dialog.setWindowTitle("トレース")
+        form = QFormLayout(dialog)
+        info = QLabel(
+            f"mosaic{slot} を現在フレーム {start_frame} から何フレーム先までトレースしますか？\n"
+            "途中で対象を見失った場合は、そのフレームで停止します。"
         )
-        if not ok:
+        info.setWordWrap(True)
+        form.addRow(info)
+        length_spin = QSpinBox()
+        length_spin.setRange(1, 999999)
+        length_spin.setValue(default_length)
+        form.addRow("トレース長さ", length_spin)
+        scale_check = QCheckBox("T Scale（枠サイズの変化を許可）")
+        scale_check.setChecked(self.trace_scale_enabled(slot))
+        form.addRow("", scale_check)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             log_user_action("追跡開始キャンセル", frame=start_frame, slot=slot, source=source)
             self.refresh_mosaic_table()
             return
+        length = length_spin.value()
+        if scale_check.isChecked():
+            self.trace_scale_slots.add(slot)
+        else:
+            self.trace_scale_slots.discard(slot)
 
         end_index = min(len(self.data.rows) - 1, self.current_index + length)
         try:
@@ -4508,7 +4490,7 @@ class EditorWindow(QMainWindow):
             self.remember_recipe_path(target_path)
             self.original_rows = [dict(row) for row in self.data.rows]
             self.dirty = False
-            self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
+            self.setWindowTitle(f"saika ver.{APP_VERSION} - {self.csv_path.name}")
             self.refresh_modified_markers()
             if hasattr(self, "frame_table_model"):
                 self.frame_table_model.refresh_all()
