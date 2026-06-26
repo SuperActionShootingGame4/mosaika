@@ -86,7 +86,6 @@ from mosaic_censor import (
 )
 
 MAX_MOSAICS = 255
-DEFAULT_VISIBLE_MOSAICS = 5
 HANDLE_SIZE = 8
 DEFAULT_INTENSITY_SLIDER_MAX = 100
 MIN_ZOOM = 0.25
@@ -1724,6 +1723,7 @@ class SequenceSlider(QSlider):
         self.keep_ranges: list[tuple[int, int]] = []
         self.person_ranges: list[tuple[int, int, int]] = []
         self.modified_ranges: list[tuple[int, int]] = []
+        self.mosaic_ranges: list[tuple[int, int]] = []
         self.keep_start_marker: int | None = None
         self.keep_end_marker: int | None = None
         self.jump_dragging = False
@@ -1754,6 +1754,10 @@ class SequenceSlider(QSlider):
 
     def set_modified_ranges(self, modified_ranges: list[tuple[int, int]]) -> None:
         self.modified_ranges = modified_ranges
+        self.update()
+
+    def set_mosaic_ranges(self, mosaic_ranges: list[tuple[int, int]]) -> None:
+        self.mosaic_ranges = mosaic_ranges
         self.update()
 
     def set_keep_markers(self, start_frame: int | None, end_frame: int | None) -> None:
@@ -1823,6 +1827,7 @@ class SequenceSlider(QSlider):
                 alignment = Qt.AlignmentFlag.AlignRight
             painter.drawText(label_x, 29, 80, 13, alignment, str(frame_no))
         self.paint_person_ranges(painter, option, handle)
+        self.paint_mosaic_ranges(painter, option, handle)
         self.paint_modified_ranges(painter, option, handle)
         self.paint_keep_markers(painter, option, handle)
 
@@ -1939,6 +1944,38 @@ class SequenceSlider(QSlider):
             line_left = min(self.width() - 1, left + 14)
             line_right = max(line_left + 8, right)
             painter.drawLine(line_left, y, min(self.width() - 1, line_right), y)
+
+    def paint_mosaic_ranges(self, painter: QPainter, option: QStyleOptionSlider, handle: QRect) -> None:
+        if not self.frame_numbers or not self.mosaic_ranges:
+            return
+        slider_max = max(1, self.width() - handle.width())
+        left_offset = handle.width() // 2
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+
+        def frame_to_x(frame_no: int) -> int:
+            index = self.tick_index(frame_no)
+            position = QStyle.sliderPositionFromValue(
+                self.minimum(),
+                self.maximum(),
+                max(self.minimum(), min(self.maximum(), index)),
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+            return position + left_offset
+
+        painter.setPen(QPen(QColor(30, 180, 60), 3))
+        y = min(self.height() - 1, groove.bottom() + 7)
+        for start_frame, end_frame in self.mosaic_ranges:
+            left = frame_to_x(start_frame)
+            right = frame_to_x(end_frame)
+            if right < left:
+                left, right = right, left
+            painter.drawLine(left, y, max(left + 2, right), y)
 
     def paint_modified_ranges(self, painter: QPainter, option: QStyleOptionSlider, handle: QRect) -> None:
         if not self.frame_numbers or not self.modified_ranges:
@@ -2451,10 +2488,16 @@ class EditorWindow(QMainWindow):
         self.addAction(next_page_action)
 
         delete_mosaic_action = QAction("選択モザイクを削除", self)
-        delete_mosaic_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        delete_mosaic_action.setShortcut(QKeySequence(Qt.Key.Key_Backspace))
         delete_mosaic_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         delete_mosaic_action.triggered.connect(self.disable_selected)
         self.addAction(delete_mosaic_action)
+
+        clear_frame_action = QAction("選択フレームをクリア", self)
+        clear_frame_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        clear_frame_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        clear_frame_action.triggered.connect(self.clear_selected_frames)
+        self.addAction(clear_frame_action)
 
         splitter = QSplitter()
         self.setCentralWidget(splitter)
@@ -2519,6 +2562,7 @@ class EditorWindow(QMainWindow):
         self.sequence_slider.set_keep_ranges(self.keep_ranges())
         self.sequence_slider.set_person_ranges(self.person_ranges())
         self.sequence_slider.set_modified_ranges(self.modified_ranges())
+        self.sequence_slider.set_mosaic_ranges(self.mosaic_active_ranges())
         left_layout.addWidget(self.sequence_slider)
 
         nav = QHBoxLayout()
@@ -2619,7 +2663,7 @@ class EditorWindow(QMainWindow):
         right_layout.addWidget(self.encode_button)
         right_layout.addWidget(self.restore_frame_button)
 
-        self.mosaic_table = QTableWidget(DEFAULT_VISIBLE_MOSAICS, 14)
+        self.mosaic_table = QTableWidget(1, 14)
         self.mosaic_table.setHorizontalHeaderLabels(
             [
                 "mosaic", "Trace", "T scale", "Start", "End", "type", "score",
@@ -3186,6 +3230,7 @@ class EditorWindow(QMainWindow):
             progress.hide()
         self.sequence_slider.set_person_ranges(self.person_ranges())
         self.sequence_slider.set_modified_ranges(self.modified_ranges())
+        self.sequence_slider.set_mosaic_ranges(self.mosaic_active_ranges())
 
     def row_modified(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.original_rows):
@@ -3221,6 +3266,40 @@ class EditorWindow(QMainWindow):
     def refresh_modified_markers(self) -> None:
         if hasattr(self, "sequence_slider"):
             self.sequence_slider.set_modified_ranges(self.modified_ranges())
+            self.sequence_slider.set_mosaic_ranges(self.mosaic_active_ranges())
+
+    def mosaic_active_ranges(self) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        current_start: int | None = None
+        current_end: int | None = None
+        for row in self.data.rows:
+            try:
+                frame_no = int(row.get("frame_no", ""))
+            except ValueError:
+                continue
+            # モザイクマトリクスに行が出る条件（rect を持つスロット）と一致させる。
+            # ON/OFF は問わない。
+            has_active = any(
+                get_rect(row, slot) is not None
+                for slot in range(1, MAX_MOSAICS + 1)
+                if row.get(f"mosaic{slot}_x1")
+            )
+            if not has_active:
+                if current_start is not None and current_end is not None:
+                    ranges.append((current_start, current_end))
+                current_start = None
+                current_end = None
+                continue
+            if current_start is not None and current_end is not None and frame_no == current_end + 1:
+                current_end = frame_no
+                continue
+            if current_start is not None and current_end is not None:
+                ranges.append((current_start, current_end))
+            current_start = frame_no
+            current_end = frame_no
+        if current_start is not None and current_end is not None:
+            ranges.append((current_start, current_end))
+        return ranges
 
     def keep_ranges(self) -> list[tuple[int, int]]:
         try:
@@ -3348,16 +3427,15 @@ class EditorWindow(QMainWindow):
         self.canvas.update()
 
     def visible_mosaic_slots(self, row: dict[str, str]) -> list[int]:
-        visible = list(range(1, DEFAULT_VISIBLE_MOSAICS + 1))
-        for slot in range(DEFAULT_VISIBLE_MOSAICS + 1, MAX_MOSAICS + 1):
-            if (
-                is_on(row.get(f"mosaic{slot}_on"))
-                or get_rect(row, slot) is not None
-                or slot in self.trace_slots
-            ):
-                visible.append(slot)
+        visible = [
+            slot for slot in range(1, MAX_MOSAICS + 1)
+            if get_rect(row, slot) is not None or slot in self.trace_slots
+        ]
+        if not visible:
+            visible.append(1)
         if self.selected_slot not in visible:
             visible.append(self.selected_slot)
+            visible.sort()
         return visible
 
     def current_frame_no(self) -> int:
@@ -3658,6 +3736,25 @@ class EditorWindow(QMainWindow):
             if 0 <= row_index < len(self.original_rows):
                 self.data.rows[row_index] = dict(self.original_rows[row_index])
                 self.update_frame_table_row(row_index, self.data.rows[row_index])
+        self.mark_dirty()
+        self.refresh_modified_markers()
+        self.load_frame()
+        self.refresh_mosaic_table()
+
+    def clear_selected_frames(self, *args) -> None:
+        rows = sorted({index.row() for index in self.frame_table.selectedIndexes()})
+        if not rows:
+            rows = [self.current_index]
+        log_user_action("フレームクリア", rows=rows)
+        for row_index in rows:
+            if 0 <= row_index < len(self.data.rows):
+                row = self.data.rows[row_index]
+                # frame_no 以外（検出メタ・comment・全モザイク枠）を空に初期化する。
+                cleared = {key: "" for key in row}
+                cleared["frame_no"] = row.get("frame_no", "")
+                self.data.rows[row_index] = cleared
+                self.update_frame_table_row(row_index, cleared)
+        self.selected_slot = 1
         self.mark_dirty()
         self.refresh_modified_markers()
         self.load_frame()
