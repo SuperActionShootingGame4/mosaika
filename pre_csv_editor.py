@@ -73,6 +73,7 @@ from mosaic_censor import (
     MOSAIC_CSV_SUFFIXES,
     POSE_BACKENDS,
     SKELETON_EDGES,
+    build_edge_mask,
     create_blank_pre_csv,
     effective_yolo_confidence,
     frame_in_ranges,
@@ -85,12 +86,14 @@ from mosaic_censor import (
     process_video,
 )
 
-MAX_MOSAICS = 255
+MAX_MOSAICS = 64
 HANDLE_SIZE = 8
 DEFAULT_INTENSITY_SLIDER_MAX = 100
 MIN_ZOOM = 0.25
 MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
+# ＋/− ボタン1回の拡大縮小量（10パーセントポイント）
+ZOOM_BUTTON_STEP = 0.10
 DEFAULT_TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
 FRAME_SLIDER_LOAD_DELAY_MS = 35
@@ -1663,27 +1666,27 @@ def apply_preview_effect(
     if effect == "blur":
         kernel_size = intensity if intensity % 2 == 1 else intensity + 1
         processed = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
-        if shape == "circle":
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.ellipse(mask, (max(0, w // 2), max(0, h // 2)),
-                        (max(1, w // 2), max(1, h // 2)), 0, 0, 360, 255, -1)
-            roi[mask > 0] = processed[mask > 0]
-        else:
-            frame[y1:y2, x1:x2] = processed
-        return
-    small = cv2.resize(
-        roi,
-        (max(1, w // intensity), max(1, h // intensity)),
-        interpolation=cv2.INTER_LINEAR,
-    )
-    processed = cv2.resize(
-        small, (w, h), interpolation=cv2.INTER_NEAREST
-    )
+    else:
+        small = cv2.resize(
+            roi,
+            (max(1, w // intensity), max(1, h // intensity)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        processed = cv2.resize(
+            small, (w, h), interpolation=cv2.INTER_NEAREST
+        )
     if shape == "circle":
         mask = np.zeros((h, w), dtype=np.uint8)
         cv2.ellipse(mask, (max(0, w // 2), max(0, h // 2)),
                     (max(1, w // 2), max(1, h // 2)), 0, 0, 360, 255, -1)
         roi[mask > 0] = processed[mask > 0]
+    elif shape == "edge":
+        mask = build_edge_mask(roi)
+        if mask is None:
+            # エッジが取れないフレームは矩形全体にかけて検閲漏れを防ぐ。
+            frame[y1:y2, x1:x2] = processed
+        else:
+            roi[mask > 0] = processed[mask > 0]
     else:
         frame[y1:y2, x1:x2] = processed
 
@@ -2067,11 +2070,27 @@ class SequenceSlider(QSlider):
 
 
 class CanvasScrollArea(QScrollArea):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.zoom_overlay: QWidget | None = None
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         canvas = self.widget()
         if canvas is not None and hasattr(canvas, "update_canvas_size"):
             canvas.update_canvas_size()
+        self.position_zoom_overlay()
+
+    def position_zoom_overlay(self) -> None:
+        if self.zoom_overlay is None:
+            return
+        self.zoom_overlay.adjustSize()
+        margin = 8
+        viewport = self.viewport()
+        x = viewport.width() - self.zoom_overlay.width() - margin
+        y = viewport.height() - self.zoom_overlay.height() - margin
+        self.zoom_overlay.move(max(0, x), max(0, y))
+        self.zoom_overlay.raise_()
 
 
 class FrameCanvas(QWidget):
@@ -2331,9 +2350,13 @@ class FrameCanvas(QWidget):
             super().wheelEvent(event)
             return
         if event.angleDelta().y() > 0:
-            self.zoom_factor = min(MAX_ZOOM, self.zoom_factor * ZOOM_STEP)
+            self.apply_zoom(self.zoom_factor * ZOOM_STEP)
         elif event.angleDelta().y() < 0:
-            self.zoom_factor = max(MIN_ZOOM, self.zoom_factor / ZOOM_STEP)
+            self.apply_zoom(self.zoom_factor / ZOOM_STEP)
+        event.accept()
+
+    def apply_zoom(self, new_zoom: float) -> None:
+        self.zoom_factor = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
         horizontal_bar = self.scroll_area.horizontalScrollBar() if self.scroll_area else None
         vertical_bar = self.scroll_area.verticalScrollBar() if self.scroll_area else None
         horizontal_ratio = horizontal_bar.value() / horizontal_bar.maximum() if horizontal_bar and horizontal_bar.maximum() else 0.5
@@ -2344,8 +2367,9 @@ class FrameCanvas(QWidget):
         if vertical_bar is not None:
             vertical_bar.setValue(round(vertical_bar.maximum() * vertical_ratio))
         self.parent_window.update_zoom_label(self.zoom_factor)
+        if isinstance(self.scroll_area, CanvasScrollArea):
+            self.scroll_area.position_zoom_overlay()
         log_user_action("表示ズーム変更", zoom=round(self.zoom_factor, 3))
-        event.accept()
 
 
 class EditorWindow(QMainWindow):
@@ -2525,8 +2549,8 @@ class EditorWindow(QMainWindow):
         self.canvas_scroll_area.setWidget(self.canvas)
         self.canvas.set_scroll_area(self.canvas_scroll_area)
         left_layout.addWidget(self.canvas_scroll_area, stretch=1)
+        self.build_zoom_overlay()
         self.frame_label = QLabel()
-        self.zoom_label = QLabel("100%")
         self.preview_checkbox = QCheckBox("mosaicプレビュー")
         self.preview_checkbox.setChecked(True)
         self.crotch_overlay_checkbox = QCheckBox("Crotch")
@@ -2535,7 +2559,6 @@ class EditorWindow(QMainWindow):
         self.skeleton_overlay_checkbox.setChecked(True)
         frame_status_layout = QHBoxLayout()
         frame_status_layout.addWidget(self.frame_label)
-        frame_status_layout.addWidget(self.zoom_label)
         frame_status_layout.addWidget(self.preview_checkbox)
         frame_status_layout.addWidget(self.crotch_overlay_checkbox)
         frame_status_layout.addWidget(self.skeleton_overlay_checkbox)
@@ -2661,6 +2684,18 @@ class EditorWindow(QMainWindow):
         right_layout.addWidget(QLabel("CSV行"))
         right_layout.addWidget(self.frame_table, stretch=1)
 
+        # モザイクマトリクスはフレーム行選択マトリクスのすぐ下に配置する。
+        self.mosaic_table = QTableWidget(1, 14)
+        self.mosaic_table.setHorizontalHeaderLabels(
+            [
+                "mosaic", "Trace", "T scale", "Start", "End", "type", "score",
+                "w", "h", "x1", "y1", "x2", "y2", "comment",
+            ]
+        )
+        self.mosaic_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.mosaic_table.horizontalHeader().setStretchLastSection(True)
+        right_layout.addWidget(self.mosaic_table, stretch=1)
+
         self.type_input = QLineEdit()
         self.type_input.setPlaceholderText("mosaic type")
         self.auto_track_status = QLabel("")
@@ -2677,16 +2712,6 @@ class EditorWindow(QMainWindow):
         right_layout.addWidget(self.encode_button)
         right_layout.addWidget(self.restore_frame_button)
 
-        self.mosaic_table = QTableWidget(1, 14)
-        self.mosaic_table.setHorizontalHeaderLabels(
-            [
-                "mosaic", "Trace", "T scale", "Start", "End", "type", "score",
-                "w", "h", "x1", "y1", "x2", "y2", "comment",
-            ]
-        )
-        self.mosaic_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.mosaic_table.horizontalHeader().setStretchLastSection(True)
-        right_layout.addWidget(self.mosaic_table, stretch=1)
         splitter.addWidget(right)
         splitter.setSizes([1100, 580])
 
@@ -2838,6 +2863,46 @@ class EditorWindow(QMainWindow):
 
     def current_row(self) -> dict[str, str]:
         return self.data.rows[self.current_index]
+
+    def build_zoom_overlay(self) -> None:
+        """動画プレビュー右下に浮かぶズーム操作（＋ − リセット ％）を作る。"""
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_label.setMinimumWidth(46)
+        zoom_in_button = QPushButton("＋")
+        zoom_out_button = QPushButton("－")
+        zoom_reset_button = QPushButton("リセット")
+        zoom_in_button.setFixedWidth(30)
+        zoom_out_button.setFixedWidth(30)
+        zoom_in_button.clicked.connect(self.zoom_in)
+        zoom_out_button.clicked.connect(self.zoom_out)
+        zoom_reset_button.clicked.connect(self.zoom_reset)
+        overlay = QWidget(self.canvas_scroll_area.viewport())
+        layout = QHBoxLayout(overlay)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+        layout.addWidget(zoom_in_button)
+        layout.addWidget(zoom_out_button)
+        layout.addWidget(zoom_reset_button)
+        layout.addWidget(self.zoom_label)
+        overlay.setStyleSheet(
+            "QWidget { background-color: rgba(30, 30, 30, 190); border-radius: 6px; }"
+            "QLabel { color: white; background: transparent; }"
+            "QPushButton { color: white; }"
+        )
+        self.zoom_overlay = overlay
+        self.canvas_scroll_area.zoom_overlay = overlay
+        self.canvas_scroll_area.position_zoom_overlay()
+        overlay.show()
+
+    def zoom_in(self) -> None:
+        self.canvas.apply_zoom(round(self.canvas.zoom_factor + ZOOM_BUTTON_STEP, 2))
+
+    def zoom_out(self) -> None:
+        self.canvas.apply_zoom(round(self.canvas.zoom_factor - ZOOM_BUTTON_STEP, 2))
+
+    def zoom_reset(self) -> None:
+        self.canvas.apply_zoom(1.0)
 
     def update_zoom_label(self, zoom_factor: float) -> None:
         self.zoom_label.setText(f"{round(zoom_factor * 100)}%")
@@ -3284,7 +3349,7 @@ class EditorWindow(QMainWindow):
             self.sequence_slider.set_mosaic_ranges(self.mosaic_active_ranges())
 
     def mosaic_slot_count(self) -> int:
-        """CSV のヘッダに実在する mosaic スロットの最大番号を返す（255固定の全走査を避ける）。"""
+        """CSV のヘッダに実在する mosaic スロットの最大番号を返す（上限固定の全走査を避ける）。"""
         max_slot = 0
         for field in self.data.fieldnames:
             if field.startswith("mosaic") and field.endswith("_x1"):

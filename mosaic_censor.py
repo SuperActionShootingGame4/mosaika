@@ -62,8 +62,8 @@ YOLO_LABEL_SHORT: dict[str, str] = {
 
 POSE_BACKENDS = ("yolo11", "yolo8", "vitpose-h", "rtmpose", "rtmpose-wholebody")
 CENSOR_EFFECTS = ("mosaic", "blur")
-CENSOR_SHAPES = ("square", "circle")
-MAX_CSV_MOSAICS = 255
+CENSOR_SHAPES = ("square", "circle", "edge")
+MAX_CSV_MOSAICS = 64
 BASE_CSV_FIELDS = ["frame_no", "person_count", "nsfw_detection_count", "crotch_detected", "comment"]
 MOSAIC_CSV_SUFFIXES = [
     "on",
@@ -131,6 +131,39 @@ def load_pose_model(backend: str):
         raise ValueError(f"未知のポーズモデル: {backend}（選択肢: {POSE_BACKENDS}）")
 
 
+def build_edge_mask(roi: np.ndarray, min_area_ratio: float = 0.02) -> np.ndarray | None:
+    """矩形 ROI 内の物体をエッジ検出＋輪郭塗りつぶしでマスク化する。
+
+    Canny でエッジを求め、膨張・クローズ処理で閉じてから、最大面積の外側輪郭
+    だけを塗りつぶす（複数物体が写り込んでも主対象1個に絞る）。
+    物体が取れない（マスクが小さすぎる）場合は None を返し、呼び出し側で
+    矩形全体にフォールバックさせる。
+    """
+    h, w = roi.shape[:2]
+    if h < 4 or w < 4:
+        return None
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    median = float(np.median(gray))
+    lower = int(max(0, 0.66 * median))
+    upper = int(min(255, 1.33 * median))
+    edges = cv2.Canny(gray, lower, max(lower + 1, upper))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    edges = cv2.dilate(edges, kernel, iterations=2)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    # 複数の輪郭が見つかっても、最大面積の1個だけを主対象として採用する。
+    largest = max(contours, key=cv2.contourArea)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(mask, [largest], -1, 255, thickness=cv2.FILLED)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    if int(cv2.countNonZero(mask)) < min_area_ratio * h * w:
+        return None
+    return mask
+
+
 def apply_roi_shape(
     frame: np.ndarray,
     x1: int,
@@ -144,15 +177,23 @@ def apply_roi_shape(
     if shape == "square":
         result[y1:y2, x1:x2] = processed_roi
         return result
-    if shape != "circle":
-        raise ValueError(f"未知の形状: {shape}")
 
     roi = frame[y1:y2, x1:x2]
     h, w = roi.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    center = (max(0, w // 2), max(0, h // 2))
-    axes = (max(1, w // 2), max(1, h // 2))
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+    if shape == "circle":
+        mask = np.zeros((h, w), dtype=np.uint8)
+        center = (max(0, w // 2), max(0, h // 2))
+        axes = (max(1, w // 2), max(1, h // 2))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+    elif shape == "edge":
+        mask = build_edge_mask(roi)
+        if mask is None:
+            # エッジが取れないフレームは矩形全体にかけて検閲漏れを防ぐ。
+            result[y1:y2, x1:x2] = processed_roi
+            return result
+    else:
+        raise ValueError(f"未知の形状: {shape}")
+
     merged = roi.copy()
     merged[mask > 0] = processed_roi[mask > 0]
     result[y1:y2, x1:x2] = merged
