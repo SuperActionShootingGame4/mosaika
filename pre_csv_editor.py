@@ -2284,7 +2284,12 @@ class FrameCanvas(QWidget):
             return
         if event.button() == Qt.MouseButton.RightButton:
             row = self.parent_window.current_row()
+            # 右クリックは常に新規作成。選択中スロットが既に枠を持っていれば
+            # 既存枠を壊さないよう次の空きスロットへ採番する。
             slot = self.parent_window.selected_slot
+            if get_rect(row, slot) is not None:
+                slot = self.parent_window.next_free_slot(row)
+            self.parent_window.selected_slot = slot
             img_pos = self.widget_to_image(event.pos())
             self.drag_mode = "create"
             self.drag_start_img = img_pos
@@ -3542,6 +3547,13 @@ class EditorWindow(QMainWindow):
         self.update_frame_table_row(self.current_index, row)
         self.refresh_canvas_frame(skip_pose_overlay=skip_pose_overlay)
         self.canvas.update()
+
+    def next_free_slot(self, row: dict[str, str]) -> int:
+        """枠もトレースも持たない最小スロット番号を返す（空きが無ければ最終スロット）。"""
+        for slot in range(1, MAX_MOSAICS + 1):
+            if get_rect(row, slot) is None and not is_on(row.get(f"mosaic{slot}_on")) and slot not in self.trace_slots:
+                return slot
+        return MAX_MOSAICS
 
     def visible_mosaic_slots(self, row: dict[str, str]) -> list[int]:
         visible = [

@@ -16,6 +16,10 @@ echo "依存関係を確認・インストール中..."
 "$PYTHON" -m pip install -r "$SCRIPT_DIR/requirements.txt"
 "$PYTHON" -m pip install pyinstaller
 
+echo "コミットハッシュを埋め込み中..."
+BUILD_HASH="$(cd "$SCRIPT_DIR" && git rev-parse --short=7 HEAD 2>/dev/null || true)"
+printf 'BUILD_HASH = "%s"\n' "$BUILD_HASH" > "$SCRIPT_DIR/_build_version.py"
+
 echo "mosaika-pre-csv-editor をビルド中..."
 exec "$PYTHON" -m PyInstaller \
     --noconfirm \

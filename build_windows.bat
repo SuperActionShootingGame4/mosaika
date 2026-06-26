@@ -86,6 +86,11 @@ if not exist "%SCRIPT_DIR%640m.onnx" (
     exit /b 1
 )
 
+echo Embedding commit hash...
+set "BUILD_HASH="
+for /f "delims=" %%i in ('git -C "%SCRIPT_DIR%" rev-parse --short=7 HEAD 2^>nul') do set "BUILD_HASH=%%i"
+> "%SCRIPT_DIR%_build_version.py" echo BUILD_HASH = "%BUILD_HASH%"
+
 echo [1/2] Building mosaika-editor GUI...
 if defined PYINSTALLER_UPX_DIR (
     "%PYTHON%" -m PyInstaller --noconfirm --clean --upx-dir "%PYINSTALLER_UPX_DIR%" "%SCRIPT_DIR%mosaika_editor.spec"

@@ -55,6 +55,7 @@ output/
 *.tmp
 *.cache
 config.toml
+_build_version.py
 .DS_Store
 Thumbs.db
 
