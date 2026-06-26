@@ -96,6 +96,14 @@ POSE_OVERLAY_MIN_SCORE = 0.3
 FRAME_SLIDER_LOAD_DELAY_MS = 35
 TRACK_PROXY_MAX_DIM = 640
 TRACE_ORIGINAL_TEMPLATE_INTERVAL = 10
+# B2: フレーム間追跡スコアがこの値以上なら、ローリング参照との類似度が
+# 低くても「同じ対象の見た目変化」とみなしドリフト停止しない。
+TRACE_LIVE_TRUST_SCORE = 0.5
+# スケールドリフト・ガード: 追跡枠が開始枠サイズに対してこの倍率範囲を
+# 外れたら、前景の大きな構造物などへの乗り移りとみなして停止する。
+# （T scale OFF 時は枠サイズが変わらないため発火しない）
+TRACE_MAX_SCALE_RATIO = 2.0
+TRACE_MIN_SCALE_RATIO = 0.5
 
 APP_LOGGER = logging.getLogger("pre_csv_editor")
 APP_LOG_FILE_HANDLE = None
@@ -2290,7 +2298,9 @@ class FrameCanvas(QWidget):
         if rect.width() >= 2 and rect.height() >= 2:
             rect = clamp_rect(rect, self.parent_window.image_width, self.parent_window.image_height)
             set_rect(row, slot, rect, on=True)
-            self.parent_window.mark_dirty()
+            # ドラッグ中は全フレーム走査のスライダーマーカー再計算をスキップし、
+            # 確定時（mouseReleaseEvent）に一度だけ更新する。
+            self.parent_window.mark_dirty(refresh_markers=False)
             self.parent_window.refresh_mosaic_table()
             self.update()
 
@@ -2312,6 +2322,8 @@ class FrameCanvas(QWidget):
                     x2=rect.right() + 1,
                     y2=rect.bottom() + 1,
                 )
+            # ドラッグ中はスキップしていたスライダーマーカーをここで一度だけ更新。
+            self.parent_window.refresh_modified_markers()
         self.drag_mode = None
 
     def wheelEvent(self, event) -> None:
@@ -2346,7 +2358,7 @@ class EditorWindow(QMainWindow):
         self.editor_windows: list[EditorWindow] = []
         self.cap = None
         self.setWindowTitle("pre CSV Editor")
-        self.resize(1500, 980)
+        self.resize(1680, 980)
         if csv_path is None:
             self.build_empty_ui()
         else:
@@ -2644,6 +2656,8 @@ class EditorWindow(QMainWindow):
         self.frame_table.verticalHeader().setVisible(False)
         for col, width in enumerate((86, 56, 56, 64, 76, 64, 180)):
             self.frame_table.setColumnWidth(col, width)
+        # Keep 列（col 2）はユーザーが普段見ないため非表示にする。
+        self.frame_table.setColumnHidden(FrameTableModel.HEADERS.index("Keep"), True)
         right_layout.addWidget(QLabel("CSV行"))
         right_layout.addWidget(self.frame_table, stretch=1)
 
@@ -2674,7 +2688,7 @@ class EditorWindow(QMainWindow):
         self.mosaic_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(self.mosaic_table, stretch=1)
         splitter.addWidget(right)
-        splitter.setSizes([1100, 400])
+        splitter.setSizes([1100, 580])
 
         self.prev_button.clicked.connect(self.prev_frame)
         self.next_button.clicked.connect(self.next_frame)
@@ -2828,11 +2842,12 @@ class EditorWindow(QMainWindow):
     def update_zoom_label(self, zoom_factor: float) -> None:
         self.zoom_label.setText(f"{round(zoom_factor * 100)}%")
 
-    def mark_dirty(self) -> None:
+    def mark_dirty(self, refresh_markers: bool = True) -> None:
         self.dirty = True
         if not self.windowTitle().endswith("*"):
             self.setWindowTitle(self.windowTitle() + " *")
-        self.refresh_modified_markers()
+        if refresh_markers:
+            self.refresh_modified_markers()
 
     def reusable_progress_dialog(self, title: str, label: str, maximum: int, cancelable: bool = False) -> QProgressDialog:
         if self.progress_dialog is None:
@@ -3268,22 +3283,34 @@ class EditorWindow(QMainWindow):
             self.sequence_slider.set_modified_ranges(self.modified_ranges())
             self.sequence_slider.set_mosaic_ranges(self.mosaic_active_ranges())
 
+    def mosaic_slot_count(self) -> int:
+        """CSV のヘッダに実在する mosaic スロットの最大番号を返す（255固定の全走査を避ける）。"""
+        max_slot = 0
+        for field in self.data.fieldnames:
+            if field.startswith("mosaic") and field.endswith("_x1"):
+                try:
+                    max_slot = max(max_slot, int(field[len("mosaic"):-len("_x1")]))
+                except ValueError:
+                    continue
+        return min(MAX_MOSAICS, max_slot)
+
     def mosaic_active_ranges(self) -> list[tuple[int, int]]:
         ranges: list[tuple[int, int]] = []
         current_start: int | None = None
         current_end: int | None = None
+        slot_count = self.mosaic_slot_count()
         for row in self.data.rows:
             try:
                 frame_no = int(row.get("frame_no", ""))
             except ValueError:
                 continue
             # モザイクマトリクスに行が出る条件（rect を持つスロット）と一致させる。
-            # ON/OFF は問わない。
-            has_active = any(
-                get_rect(row, slot) is not None
-                for slot in range(1, MAX_MOSAICS + 1)
-                if row.get(f"mosaic{slot}_x1")
-            )
+            # ON/OFF は問わない。最初の枠が見つかった時点で打ち切る。
+            has_active = False
+            for slot in range(1, slot_count + 1):
+                if row.get(f"mosaic{slot}_x1") and get_rect(row, slot) is not None:
+                    has_active = True
+                    break
             if not has_active:
                 if current_start is not None and current_end is not None:
                     ranges.append((current_start, current_end))
@@ -3566,13 +3593,24 @@ class EditorWindow(QMainWindow):
         except ValueError:
             return
         if col == 0:
-            key = f"mosaic{self.selected_slot}_on"
+            slot = self.selected_slot
+            key = f"mosaic{slot}_on"
+            # クリックした現在行のトグル結果を、選択中の全フレーム行に同じ値で適用する。
             on = not is_on(self.current_row().get(key))
-            self.current_row()[key] = "1" if on else "0"
-            if on and get_rect(self.current_row(), self.selected_slot) is None:
-                self.populate_selected_from_nearest(on=True)
+            rows = sorted({index.row() for index in self.frame_table.selectedIndexes()})
+            if not rows:
+                rows = [self.current_index]
+            for row_index in rows:
+                if not (0 <= row_index < len(self.data.rows)):
+                    continue
+                row = self.data.rows[row_index]
+                row[key] = "1" if on else "0"
+                # ON にする行にモザイク枠が無ければ、その行を基準に直近座標で埋める。
+                if on and get_rect(row, slot) is None:
+                    self.populate_row_from_nearest(row_index, slot, on=True)
+                self.update_frame_table_row(row_index, row)
             self.mark_dirty()
-            log_user_action("モザイク有効切替", frame=self.current_frame_no(), slot=self.selected_slot, enabled=on)
+            log_user_action("モザイク有効切替", frames=rows, slot=slot, enabled=on)
             self.refresh_mosaic_table()
             return
         if col == 1:
@@ -3761,17 +3799,23 @@ class EditorWindow(QMainWindow):
         self.refresh_mosaic_table()
 
     def populate_selected_from_nearest(self, on: bool) -> bool:
-        row = self.current_row()
-        if get_rect(row, self.selected_slot) is not None:
+        return self.populate_row_from_nearest(self.current_index, self.selected_slot, on)
+
+    def populate_row_from_nearest(self, row_index: int, slot: int, on: bool) -> bool:
+        row = self.data.rows[row_index]
+        if get_rect(row, slot) is not None:
             return True
-        candidate = self.nearest_rect(self.selected_slot) or self.nearest_any_rect()
+        candidate = (
+            self.nearest_rect(slot, anchor_index=row_index)
+            or self.nearest_any_rect(anchor_index=row_index)
+        )
         if candidate is None:
             return False
         rect, label = candidate
         rect = clamp_rect(rect, self.image_width, self.image_height)
-        set_rect(row, self.selected_slot, rect, on=on)
+        set_rect(row, slot, rect, on=on)
         if label:
-            row[f"mosaic{self.selected_slot}_type"] = label
+            row[f"mosaic{slot}_type"] = label
         return True
 
     def create_from_nearest(self, *args) -> None:
@@ -3780,27 +3824,31 @@ class EditorWindow(QMainWindow):
             self.mark_dirty()
             self.refresh_mosaic_table()
 
-    def nearest_rect(self, slot: int) -> tuple[QRect, str] | None:
-        for idx in range(self.current_index - 1, -1, -1):
+    def nearest_rect(self, slot: int, anchor_index: int | None = None) -> tuple[QRect, str] | None:
+        if anchor_index is None:
+            anchor_index = self.current_index
+        for idx in range(anchor_index - 1, -1, -1):
             row = self.data.rows[idx]
             rect = get_rect(row, slot)
             if rect is not None and is_on(row.get(f"mosaic{slot}_on")):
                 return QRect(rect), row.get(f"mosaic{slot}_type", "")
-        for idx in range(self.current_index + 1, len(self.data.rows)):
+        for idx in range(anchor_index + 1, len(self.data.rows)):
             row = self.data.rows[idx]
             rect = get_rect(row, slot)
             if rect is not None and is_on(row.get(f"mosaic{slot}_on")):
                 return QRect(rect), row.get(f"mosaic{slot}_type", "")
         return None
 
-    def nearest_any_rect(self) -> tuple[QRect, str] | None:
-        for idx in range(self.current_index - 1, -1, -1):
+    def nearest_any_rect(self, anchor_index: int | None = None) -> tuple[QRect, str] | None:
+        if anchor_index is None:
+            anchor_index = self.current_index
+        for idx in range(anchor_index - 1, -1, -1):
             row = self.data.rows[idx]
             for slot in range(1, MAX_MOSAICS + 1):
                 rect = get_rect(row, slot)
                 if rect is not None and is_on(row.get(f"mosaic{slot}_on")):
                     return QRect(rect), row.get(f"mosaic{slot}_type", "")
-        for idx in range(self.current_index + 1, len(self.data.rows)):
+        for idx in range(anchor_index + 1, len(self.data.rows)):
             row = self.data.rows[idx]
             for slot in range(1, MAX_MOSAICS + 1):
                 rect = get_rect(row, slot)
@@ -3947,8 +3995,10 @@ class EditorWindow(QMainWindow):
             self.refresh_mosaic_table()
             return
         label = self.data.rows[start_index].get(f"mosaic{slot}_type", "") or "manual"
-        original_anchor_frame = anchor_frame.copy()
-        original_anchor_rect = QRect(start_rect)
+        # B1: ドリフト照合の基準を開始フレーム固定にせず、直近の信頼できた
+        # フレームへ定期更新するローリング参照にする（緩やかな見た目変化を許容）。
+        reference_frame = anchor_frame.copy()
+        reference_rect = QRect(start_rect)
         anchor_index = start_index
         anchor_rect = QRect(start_rect)
         total_trace_frames = max(1, end_index - start_index)
@@ -4018,31 +4068,62 @@ class EditorWindow(QMainWindow):
                     final_end_frame = target_frame_no
                     break
                 tracked_rect = clamp_rect(tracked_rect, next_frame.shape[1], next_frame.shape[0])
+                # スケールドリフト・ガード: 開始枠サイズに対する累積倍率が範囲外なら、
+                # 前景の大きな構造物などへの乗り移りとみなして停止する。
+                scale_w = tracked_rect.width() / max(1, start_rect.width())
+                scale_h = tracked_rect.height() / max(1, start_rect.height())
+                if (
+                    max(scale_w, scale_h) > TRACE_MAX_SCALE_RATIO
+                    or min(scale_w, scale_h) < TRACE_MIN_SCALE_RATIO
+                ):
+                    stop_message = f"mosaic{slot}: スケールドリフト(倍率 w={scale_w:.2f}, h={scale_h:.2f})"
+                    APP_LOGGER.warning(
+                        "範囲追跡停止: slot=%s target_index=%s message=%s scale_w=%.3f scale_h=%.3f max=%.2f min=%.2f",
+                        slot,
+                        target_index,
+                        stop_message,
+                        scale_w,
+                        scale_h,
+                        TRACE_MAX_SCALE_RATIO,
+                        TRACE_MIN_SCALE_RATIO,
+                    )
+                    final_end_frame = target_frame_no
+                    break
                 should_check_original = (
                     processed_count == 1
                     or processed_count % TRACE_ORIGINAL_TEMPLATE_INTERVAL == 0
                     or processed_count == total_trace_frames
                 )
                 if should_check_original:
-                    original_score = template_similarity_score(
-                        original_anchor_frame,
-                        original_anchor_rect,
+                    drift_score = template_similarity_score(
+                        reference_frame,
+                        reference_rect,
                         next_frame,
                         tracked_rect,
                     )
                     min_score = getattr(self, "trace_min_score", DEFAULT_TRACE_TO_END_MIN_SCORE)
-                    if original_score is not None and original_score < min_score:
-                        stop_message = f"mosaic{slot}: ドリフト検出(original={original_score:.3f})"
+                    # B2: 参照との類似度が低くても、フレーム間追跡スコアが十分高ければ
+                    # 「同じ対象の見た目変化」とみなして停止しない。両方低いときだけ停止。
+                    if (
+                        drift_score is not None
+                        and drift_score < min_score
+                        and score < TRACE_LIVE_TRUST_SCORE
+                    ):
+                        stop_message = f"mosaic{slot}: ドリフト検出(ref={drift_score:.3f}, live={score:.3f})"
                         APP_LOGGER.warning(
-                            "範囲追跡停止: slot=%s target_index=%s message=%s score=%.3f min=%.3f",
+                            "範囲追跡停止: slot=%s target_index=%s message=%s ref=%.3f live=%.3f min=%.3f",
                             slot,
                             target_index,
                             stop_message,
-                            original_score,
+                            drift_score,
+                            score,
                             min_score,
                         )
                         final_end_frame = target_frame_no
                         break
+                    # B1: 停止しなかった信頼できるフレームを次回比較の基準に更新する。
+                    reference_frame = next_frame.copy()
+                    reference_rect = QRect(tracked_rect)
                 span = max(1, target_index - anchor_index)
                 for idx in range(anchor_index + 1, target_index + 1):
                     t = (idx - anchor_index) / span
