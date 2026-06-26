@@ -62,7 +62,7 @@ YOLO_LABEL_SHORT: dict[str, str] = {
 
 POSE_BACKENDS = ("yolo11", "yolo8", "vitpose-h", "rtmpose", "rtmpose-wholebody")
 CENSOR_EFFECTS = ("mosaic", "blur")
-CENSOR_SHAPES = ("square", "circle", "edge")
+CENSOR_SHAPES = ("square", "circle", "edge", "grabcut")
 MAX_CSV_MOSAICS = 64
 BASE_CSV_FIELDS = ["frame_no", "person_count", "nsfw_detection_count", "crotch_detected", "comment"]
 MOSAIC_CSV_SUFFIXES = [
@@ -164,6 +164,48 @@ def build_edge_mask(roi: np.ndarray, min_area_ratio: float = 0.02) -> np.ndarray
     return mask
 
 
+def build_grabcut_mask(
+    roi: np.ndarray,
+    iter_count: int = 5,
+    min_area_ratio: float = 0.02,
+    max_dim: int = 256,
+) -> np.ndarray | None:
+    """矩形 ROI 内の主対象を GrabCut（前景/背景分離）でマスク化する。
+
+    矩形の外周マージンを「ほぼ背景」、内側を「ほぼ前景」のシードとして
+    GrabCut を回し、背景（木など）の色を学習して除外する。エッジ方式より
+    背景の写り込みに強い。処理コストを抑えるため縮小画像で計算する。
+    取れない場合は None（呼び出し側で矩形全体にフォールバック）。
+    """
+    h, w = roi.shape[:2]
+    if h < 8 or w < 8:
+        return None
+    scale = min(1.0, max_dim / max(h, w))
+    if scale < 1.0:
+        sw, sh = max(8, round(w * scale)), max(8, round(h * scale))
+        work = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        work, sw, sh = roi, w, h
+    mask = np.zeros((sh, sw), np.uint8)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    margin_x = max(1, int(sw * 0.08))
+    margin_y = max(1, int(sh * 0.08))
+    rect = (margin_x, margin_y, max(1, sw - 2 * margin_x), max(1, sh - 2 * margin_y))
+    try:
+        cv2.grabCut(work, mask, rect, bgd_model, fgd_model, iter_count, cv2.GC_INIT_WITH_RECT)
+    except cv2.error:
+        return None
+    binary = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    if scale < 1.0:
+        binary = cv2.resize(binary, (w, h), interpolation=cv2.INTER_NEAREST)
+    if int(cv2.countNonZero(binary)) < min_area_ratio * h * w:
+        return None
+    return binary
+
+
 def apply_roi_shape(
     frame: np.ndarray,
     x1: int,
@@ -189,6 +231,12 @@ def apply_roi_shape(
         mask = build_edge_mask(roi)
         if mask is None:
             # エッジが取れないフレームは矩形全体にかけて検閲漏れを防ぐ。
+            result[y1:y2, x1:x2] = processed_roi
+            return result
+    elif shape == "grabcut":
+        mask = build_grabcut_mask(roi)
+        if mask is None:
+            # 前景が取れないフレームは矩形全体にかけて検閲漏れを防ぐ。
             result[y1:y2, x1:x2] = processed_roi
             return result
     else:

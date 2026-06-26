@@ -74,6 +74,7 @@ from mosaic_censor import (
     POSE_BACKENDS,
     SKELETON_EDGES,
     build_edge_mask,
+    build_grabcut_mask,
     create_blank_pre_csv,
     effective_yolo_confidence,
     frame_in_ranges,
@@ -1687,6 +1688,13 @@ def apply_preview_effect(
             frame[y1:y2, x1:x2] = processed
         else:
             roi[mask > 0] = processed[mask > 0]
+    elif shape == "grabcut":
+        mask = build_grabcut_mask(roi)
+        if mask is None:
+            # 前景が取れないフレームは矩形全体にかけて検閲漏れを防ぐ。
+            frame[y1:y2, x1:x2] = processed
+        else:
+            roi[mask > 0] = processed[mask > 0]
     else:
         frame[y1:y2, x1:x2] = processed
 
@@ -2696,20 +2704,12 @@ class EditorWindow(QMainWindow):
         self.mosaic_table.horizontalHeader().setStretchLastSection(True)
         right_layout.addWidget(self.mosaic_table, stretch=1)
 
-        self.type_input = QLineEdit()
-        self.type_input.setPlaceholderText("mosaic type")
         self.auto_track_status = QLabel("")
         self.auto_track_status.setWordWrap(True)
         self.create_from_nearest_button = QPushButton("直近枠から作成")
-        self.save_button = QPushButton("保存")
-        self.encode_button = QPushButton("エンコード")
         self.restore_frame_button = QPushButton("選択したフレームを元に戻す(複数可能)")
-        right_layout.addWidget(QLabel("Type"))
-        right_layout.addWidget(self.type_input)
         right_layout.addWidget(self.auto_track_status)
         right_layout.addWidget(self.create_from_nearest_button)
-        right_layout.addWidget(self.save_button)
-        right_layout.addWidget(self.encode_button)
         right_layout.addWidget(self.restore_frame_button)
 
         splitter.addWidget(right)
@@ -2721,8 +2721,6 @@ class EditorWindow(QMainWindow):
         self.next_skip_button.clicked.connect(self.next_skip_frame)
         self.go_button.clicked.connect(self.go_to_frame)
         self.sequence_slider.valueChanged.connect(self.select_sequence_frame)
-        self.save_button.clicked.connect(self.save_with_confirm)
-        self.encode_button.clicked.connect(self.encode_post)
         self.restore_frame_button.clicked.connect(self.restore_current_frame)
         self.create_from_nearest_button.clicked.connect(self.create_from_nearest)
         self.keep_start_button.clicked.connect(self.set_keep_range_start)
@@ -2740,7 +2738,6 @@ class EditorWindow(QMainWindow):
         self.intensity_spin.valueChanged.connect(self.sync_intensity_slider)
         self.intensity_spin.valueChanged.connect(self.update_preview_meta)
         self.trace_min_score_spin.valueChanged.connect(self.update_trace_min_score)
-        self.type_input.editingFinished.connect(self.update_selected_type)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
         self.frame_table.clicked.connect(self.select_frame_row)
@@ -2751,14 +2748,21 @@ class EditorWindow(QMainWindow):
         )
 
     def build_menu(self) -> None:
-        menu = self.menuBar().addMenu("メニュー")
+        menu = self.menuBar().addMenu("ファイル")
+        operation_menu = self.menuBar().addMenu("操作")
+
         version_action = QAction(f"version {APP_VERSION}", self)
         version_action.setEnabled(False)
         self.menuBar().addAction(version_action)
 
         create_action = QAction("レシピ生成", self)
         create_action.triggered.connect(self.create_recipe_from_menu)
-        menu.addAction(create_action)
+        operation_menu.addAction(create_action)
+
+        encode_action = QAction("エンコード", self)
+        encode_action.triggered.connect(self.encode_post)
+        encode_action.setEnabled(self.csv_path is not None)
+        operation_menu.addAction(encode_action)
 
         open_action = QAction("レシピを開く", self)
         open_action.triggered.connect(self.open_recipe_from_menu)
@@ -2777,11 +2781,6 @@ class EditorWindow(QMainWindow):
         save_action.triggered.connect(self.save_with_confirm)
         save_action.setEnabled(self.csv_path is not None)
         menu.addAction(save_action)
-
-        encode_action = QAction("エンコード", self)
-        encode_action.triggered.connect(self.encode_post)
-        encode_action.setEnabled(self.csv_path is not None)
-        menu.addAction(encode_action)
 
         menu.addSeparator()
 
@@ -3513,7 +3512,6 @@ class EditorWindow(QMainWindow):
         selected_row = visible_slots.index(self.selected_slot) if self.selected_slot in visible_slots else 0
         self.mosaic_table.selectRow(selected_row)
         self.mosaic_table.scrollToItem(self.mosaic_table.item(selected_row, 0))
-        self.type_input.setText(row.get(f"mosaic{self.selected_slot}_type", ""))
         self.update_frame_table_row(self.current_index, row)
         self.refresh_canvas_frame(skip_pose_overlay=skip_pose_overlay)
         self.canvas.update()
@@ -3816,12 +3814,6 @@ class EditorWindow(QMainWindow):
         self.set_keep_ranges([])
         log_user_action("残す範囲クリア")
         self.auto_track_status.setText("残す範囲をクリアしました")
-
-    def update_selected_type(self, *args) -> None:
-        self.current_row()[f"mosaic{self.selected_slot}_type"] = self.type_input.text()
-        log_user_action("選択モザイクtype変更", frame=self.current_frame_no(), slot=self.selected_slot, value=self.type_input.text())
-        self.mark_dirty()
-        self.refresh_mosaic_table()
 
     def disable_selected(self, *args) -> None:
         self.current_row()[f"mosaic{self.selected_slot}_on"] = "0"
@@ -4366,6 +4358,9 @@ class EditorWindow(QMainWindow):
             APP_LOGGER.info("エンコード不可: レシピ未選択")
             QMessageBox.information(self, "未選択", "レシピが開かれていません。")
             return
+        if getattr(self, "_encoding", False):
+            APP_LOGGER.info("エンコード多重起動を無視")
+            return
         log_user_action("エンコード開始要求", csv_path=self.csv_path)
         output_path = post_output_path_from_csv(self.csv_path)
         log_path = output_path.with_name(f"{output_path.stem}_log.txt")
@@ -4379,9 +4374,9 @@ class EditorWindow(QMainWindow):
         if result != QMessageBox.StandardButton.Ok:
             log_user_action("エンコードキャンセル", csv_path=self.csv_path)
             return
-        self.encode_button.setEnabled(False)
+        self._encoding = True
         dialog = PostProgressDialog(self.csv_path, output_path, log_path, self)
-        dialog.finished.connect(lambda _result: self.encode_button.setEnabled(True))
+        dialog.finished.connect(lambda _result: setattr(self, "_encoding", False))
         dialog.show()
         dialog.set_stage_progress("エンコード前に保存中...", 0, max(1, len(self.data.rows)))
         try:
@@ -4391,12 +4386,12 @@ class EditorWindow(QMainWindow):
                 refresh_table=False,
             )
         except EncodingCancelled as exc:
-            self.encode_button.setEnabled(True)
+            self._encoding = False
             dialog.reject()
             QMessageBox.information(self, "キャンセル", str(exc))
             return
         except Exception as exc:
-            self.encode_button.setEnabled(True)
+            self._encoding = False
             dialog.reject()
             QMessageBox.critical(self, "Error", f"保存に失敗したためエンコードできません: {exc}")
             return
