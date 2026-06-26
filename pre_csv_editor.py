@@ -8,7 +8,10 @@ import bisect
 import csv
 import faulthandler
 import logging
+import math
 import platform
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -24,7 +27,7 @@ except ImportError:
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal, qInstallMessageHandler
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, pyqtSignal, qInstallMessageHandler
 from PyQt6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -52,6 +55,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QStyle,
     QStyleOptionSlider,
+    QAbstractItemView,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -60,8 +65,11 @@ from PyQt6.QtWidgets import (
 
 from app_version import APP_VERSION
 from mosaic_censor import (
+    BASE_CSV_FIELDS,
     CENSOR_EFFECTS,
     CENSOR_SHAPES,
+    MAX_CSV_MOSAICS,
+    MOSAIC_CSV_SUFFIXES,
     POSE_BACKENDS,
     SKELETON_EDGES,
     create_blank_pre_csv,
@@ -86,6 +94,7 @@ ZOOM_STEP = 1.15
 TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
 FRAME_SLIDER_LOAD_DELAY_MS = 35
+TRACK_PROXY_MAX_DIM = 640
 
 APP_LOGGER = logging.getLogger("pre_csv_editor")
 APP_LOG_FILE_HANDLE = None
@@ -208,10 +217,17 @@ def _get_config_path() -> Path:
 
 CONFIG_PATH = _get_config_path()
 RECIPE_CONFIG_SECTION = "recipe_generation"
+EDITOR_CONFIG_SECTION = "editor"
 DISPLAY_SEQUENTIAL_MAX_SKIP = 120
+FAST_SEEK_PREROLL_SEC = 2.0
+FAST_SEEK_TIMEOUT_SEC = 8.0
 
 
 class RecipeGenerationCancelled(Exception):
+    pass
+
+
+class EncodingCancelled(Exception):
     pass
 
 
@@ -222,7 +238,20 @@ def progress_text(current: int, total: int, elapsed: float) -> str:
     return f"{current}/{total} frame  残り {time.strftime('%H:%M:%S', time.gmtime(remaining))}"
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    return time.strftime("%H:%M:%S", time.gmtime(seconds))
+
+
 def load_recipe_config() -> dict:
+    return load_config_section(RECIPE_CONFIG_SECTION)
+
+
+def load_editor_config() -> dict:
+    return load_config_section(EDITOR_CONFIG_SECTION)
+
+
+def load_config_section(section_name: str) -> dict:
     if not CONFIG_PATH.is_file():
         return {}
     try:
@@ -234,7 +263,7 @@ def load_recipe_config() -> dict:
     except Exception:
         APP_LOGGER.warning("設定ファイルを読み込めません: %s", CONFIG_PATH, exc_info=True)
         return {}
-    section = data.get(RECIPE_CONFIG_SECTION, {})
+    section = data.get(section_name, {})
     return section if isinstance(section, dict) else {}
 
 
@@ -283,27 +312,60 @@ def toml_value(value) -> str:
 
 
 def save_recipe_config(settings: dict) -> None:
-    lines = [
-        f"[{RECIPE_CONFIG_SECTION}]",
-        f"video_path = {toml_value(settings['video_path'])}",
-        f"pose_model = {toml_value(settings['pose_model'])}",
-        f"all_frames = {toml_value(settings['all_frames'])}",
-        f"start_frame = {toml_value(settings['start_frame'])}",
-        f"end_frame = {toml_value(settings['end_frame'])}",
-        f"confidence = {toml_value(settings['confidence'])}",
-        f"intensity = {toml_value(settings['intensity'])}",
-        f"effect = {toml_value(settings['effect'])}",
-        f"shape = {toml_value(settings['shape'])}",
-        f"detect_every = {toml_value(settings['detect_every'])}",
-        f"interpolate_gap = {toml_value(settings['interpolate_gap'])}",
-        f"yolo_nsfw_model = {toml_value(settings['yolo_nsfw_model'])}",
-        f"yolo_confidence = {toml_value(settings['yolo_confidence'])}",
-        f"no_crotch = {toml_value(settings['no_crotch'])}",
-        f"skip_no_person = {toml_value(settings['skip_no_person'])}",
-        f"blank_recipe = {toml_value(settings['blank_recipe'])}",
-        "",
-    ]
+    section = {
+        "video_path": settings["video_path"],
+        "pose_model": settings["pose_model"],
+        "all_frames": settings["all_frames"],
+        "start_frame": settings["start_frame"],
+        "end_frame": settings["end_frame"],
+        "confidence": settings["confidence"],
+        "intensity": settings["intensity"],
+        "effect": settings["effect"],
+        "shape": settings["shape"],
+        "detect_every": settings["detect_every"],
+        "interpolate_gap": settings["interpolate_gap"],
+        "yolo_nsfw_model": settings["yolo_nsfw_model"],
+        "yolo_confidence": settings["yolo_confidence"],
+        "no_crotch": settings["no_crotch"],
+        "skip_no_person": settings["skip_no_person"],
+        "blank_recipe": settings["blank_recipe"],
+    }
+    save_config_section(RECIPE_CONFIG_SECTION, section)
+
+
+def save_editor_config_value(key: str, value) -> None:
+    section = load_editor_config()
+    section[key] = value
+    save_config_section(EDITOR_CONFIG_SECTION, section)
+
+
+def save_config_section(section_name: str, values: dict) -> None:
+    data = load_all_config()
+    data[section_name] = values
+    lines: list[str] = []
+    for section, section_values in data.items():
+        if not isinstance(section_values, dict):
+            continue
+        lines.append(f"[{section}]")
+        for key, value in section_values.items():
+            lines.append(f"{key} = {toml_value(value)}")
+        lines.append("")
     CONFIG_PATH.write_text("\n".join(lines), encoding="utf-8")
+
+
+def load_all_config() -> dict:
+    if not CONFIG_PATH.is_file():
+        return {}
+    try:
+        if tomllib is not None:
+            with open(CONFIG_PATH, "rb") as f:
+                data = tomllib.load(f)
+        else:
+            data = load_recipe_config_fallback(CONFIG_PATH)
+    except Exception:
+        APP_LOGGER.warning("設定ファイルを読み込めません: %s", CONFIG_PATH, exc_info=True)
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def config_bool(config: dict, key: str, default: bool) -> bool:
@@ -475,6 +537,16 @@ class PostWorker(QObject):
         self.csv_path = csv_path
         self.output_path = output_path
         self.log_path = log_path
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        APP_LOGGER.info("PostWorkerキャンセル要求: csv=%s output=%s", self.csv_path, self.output_path)
+        self.cancel_requested = True
+
+    def emit_progress(self, current: int, total: int, elapsed: float) -> None:
+        if self.cancel_requested:
+            raise EncodingCancelled("エンコードをキャンセルしました。")
+        self.progress.emit(current, total, elapsed)
 
     def run(self) -> None:
         try:
@@ -489,10 +561,13 @@ class PostWorker(QObject):
                     csv_path=str(self.csv_path),
                     output_path=str(self.output_path),
                     log_file=lf,
-                    progress_callback=self.progress.emit,
+                    progress_callback=self.emit_progress,
                 )
             APP_LOGGER.info("エンコード完了: output=%s", self.output_path)
             self.finished.emit(str(self.output_path))
+        except EncodingCancelled as exc:
+            APP_LOGGER.info("エンコードキャンセル: csv=%s output=%s", self.csv_path, self.output_path)
+            self.failed.emit(str(exc))
         except Exception as exc:
             APP_LOGGER.exception("エンコードエラー: csv=%s output=%s", self.csv_path, self.output_path)
             self.failed.emit(str(exc))
@@ -688,11 +763,10 @@ class PreCreateDialog(QDialog):
         frame_range = self.frame_range()
         if frame_range is not None:
             range_suffix = f"_frames{frame_range[0]}-{frame_range[1]}"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         stem = self.video_path.stem
-        kind = "blank_pre" if blank_recipe else "pre"
-        csv_path = self.video_path.with_name(f"{stem}{range_suffix}_{kind}_{stamp}.csv")
-        log_path = self.video_path.with_name(f"{stem}{range_suffix}_{kind}_{stamp}_log.txt")
+        kind = "blank_rcp" if blank_recipe else "rcp"
+        csv_path = self.video_path.with_name(f"{stem}{range_suffix}_{kind}.csv")
+        log_path = self.video_path.with_name(f"{stem}{range_suffix}_{kind}_log.txt")
         return csv_path, log_path
 
     def frame_range(self) -> tuple[int, int] | None:
@@ -748,6 +822,15 @@ class PreCreateDialog(QDialog):
             return
         blank_recipe = self.blank_recipe_check.isChecked()
         csv_path, log_path = self.output_paths(blank_recipe)
+        if csv_path.exists():
+            result = QMessageBox.question(
+                self,
+                "上書き確認",
+                f"{csv_path.name} は既に存在します。上書きしますか？",
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                log_user_action("レシピ生成 上書きキャンセル", csv_path=csv_path)
+                return
         yolo_model = self.yolo_model_input.text().strip() or None
         yolo_conf = None if self.yolo_confidence_spin.value() <= 0 else self.yolo_confidence_spin.value()
         options = {
@@ -950,14 +1033,18 @@ class PostProgressDialog(QDialog):
         self.worker: PostWorker | None = None
         self.finished_output: str | None = None
         self.failed_message: str | None = None
+        self.cancel_requested = False
         self.running = False
         self.setWindowTitle("エンコード")
         self.resize(460, 140)
         layout = QVBoxLayout(self)
         self.label = QLabel("エンコード準備中...")
         self.progress_bar = QProgressBar()
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.rejected.connect(self.request_cancel)
         layout.addWidget(self.label)
         layout.addWidget(self.progress_bar)
+        layout.addWidget(self.buttons)
 
     def set_stage_progress(self, message: str, current: int, total: int, started_at: float | None = None) -> None:
         self.progress_bar.setMaximum(max(1, total))
@@ -972,6 +1059,14 @@ class PostProgressDialog(QDialog):
                 f"{message} {percent}%  残り "
                 f"{time.strftime('%H:%M:%S', time.gmtime(max(0, remaining)))}"
             )
+        QApplication.processEvents()
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+        self.label.setText("キャンセル中...")
+        self.buttons.setEnabled(False)
+        if self.worker is not None:
+            self.worker.cancel()
         QApplication.processEvents()
 
     def start(self) -> None:
@@ -992,9 +1087,11 @@ class PostProgressDialog(QDialog):
         self.thread.start()
 
     def update_progress(self, current: int, total: int, elapsed: float) -> None:
+        if self.cancel_requested and self.worker is not None:
+            self.worker.cancel()
         self.progress_bar.setMaximum(max(1, total))
         self.progress_bar.setValue(current)
-        self.label.setText(progress_text(current, total, elapsed))
+        self.label.setText(f"エンコード中... {progress_text(current, total, elapsed)}")
 
     def post_finished(self, output_path: str) -> None:
         self.finished_output = output_path
@@ -1005,8 +1102,12 @@ class PostProgressDialog(QDialog):
     def post_thread_finished(self) -> None:
         self.running = False
         if self.failed_message:
-            APP_LOGGER.error("エンコード失敗表示: %s", self.failed_message)
-            QMessageBox.critical(self, "Error", self.failed_message)
+            if self.cancel_requested or "キャンセル" in self.failed_message:
+                APP_LOGGER.info("エンコードキャンセル表示: %s", self.failed_message)
+                QMessageBox.information(self, "キャンセル", self.failed_message)
+            else:
+                APP_LOGGER.error("エンコード失敗表示: %s", self.failed_message)
+                QMessageBox.critical(self, "Error", self.failed_message)
             self.reject()
             return
         if self.finished_output:
@@ -1016,8 +1117,7 @@ class PostProgressDialog(QDialog):
 
     def reject(self) -> None:
         if self.running:
-            APP_LOGGER.warning("エンコード中に閉じる操作が行われました")
-            QMessageBox.information(self, "処理中", "エンコード中は閉じられません。")
+            self.request_cancel()
             return
         super().reject()
 
@@ -1033,30 +1133,72 @@ class CsvData:
         return {row[0]: row[1] for row in self.meta if len(row) >= 2}
 
 
-def read_pre_csv(path: Path) -> CsvData:
+def read_pre_csv(path: Path, progress_callback=None) -> CsvData:
     meta: list[list[str]] = []
+    total_size = max(1, path.stat().st_size)
+    last_progress = 0
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
         for row in reader:
             if not row:
                 continue
             if row[0] == "frame_no":
-                return CsvData(meta=meta, fieldnames=row, rows=list(csv.DictReader(f, fieldnames=row)))
+                fieldnames = row
+                rows: list[dict[str, str]] = []
+                dict_reader = csv.DictReader(f, fieldnames=fieldnames)
+                for data_row in dict_reader:
+                    rows.append(data_row)
+                    if progress_callback is not None:
+                        current = min(total_size, f.buffer.tell())
+                        if current - last_progress >= total_size // 200 or current == total_size:
+                            progress_callback(current, total_size)
+                            last_progress = current
+                if progress_callback is not None:
+                    progress_callback(total_size, total_size)
+                return CsvData(meta=meta, fieldnames=fieldnames, rows=rows)
             meta.append(row)
     raise RuntimeError("frame_no ヘッダ行が見つかりません")
 
 
+def compact_pre_csv_fieldnames(data: CsvData, progress_callback=None) -> list[str]:
+    max_slot = 0
+    total = max(1, len(data.rows) * 2)
+    for row_index, row in enumerate(data.rows):
+        for slot in range(1, MAX_CSV_MOSAICS + 1):
+            if is_on(row.get(f"mosaic{slot}_on")) or get_rect(row, slot) is not None:
+                max_slot = max(max_slot, slot)
+                continue
+            if any((row.get(f"mosaic{slot}_{suffix}") or "").strip() for suffix in MOSAIC_CSV_SUFFIXES if suffix != "on"):
+                max_slot = max(max_slot, slot)
+        if progress_callback is not None and (row_index % 20 == 0 or row_index + 1 == len(data.rows)):
+            progress_callback(row_index + 1, total)
+
+    fieldnames = list(BASE_CSV_FIELDS)
+    for slot in range(1, max_slot + 1):
+        fieldnames.extend(f"mosaic{slot}_{suffix}" for suffix in MOSAIC_CSV_SUFFIXES)
+
+    known = set(fieldnames)
+    for fieldname in data.fieldnames:
+        if fieldname not in known and not fieldname.startswith("mosaic"):
+            fieldnames.append(fieldname)
+            known.add(fieldname)
+    return fieldnames
+
+
 def write_pre_csv(path: Path, data: CsvData, progress_callback=None) -> None:
+    row_count = len(data.rows)
+    total = max(1, row_count * 2)
+    fieldnames = compact_pre_csv_fieldnames(data, progress_callback=progress_callback)
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(data.meta)
-        dict_writer = csv.DictWriter(f, fieldnames=data.fieldnames, extrasaction="ignore")
+        dict_writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         dict_writer.writeheader()
-        total = len(data.rows)
         for idx, row in enumerate(data.rows):
             dict_writer.writerow(row)
-            if progress_callback is not None and (idx % 20 == 0 or idx + 1 == total):
-                progress_callback(idx + 1, total)
+            if progress_callback is not None and (idx % 20 == 0 or idx + 1 == row_count):
+                progress_callback(row_count + idx + 1, total)
+    data.fieldnames = fieldnames
 
 
 def set_meta_value(data: CsvData, key: str, value: str) -> None:
@@ -1154,6 +1296,117 @@ def rect_to_xywh(rect: QRect) -> tuple[int, int, int, int]:
 
 def xywh_to_rect(x: int, y: int, width: int, height: int) -> QRect:
     return QRect(x, y, max(1, width), max(1, height))
+
+
+class FrameTableModel(QAbstractTableModel):
+    HEADERS = ["frame_no", "modify", "Keep", "Persons", "Mosaic", "Crotch", "comment"]
+
+    def __init__(self, editor: "EditorWindow") -> None:
+        super().__init__(editor)
+        self.editor = editor
+        self._keep_ranges: list[tuple[int, int]] = []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self.editor.data.rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self.HEADERS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal and 0 <= section < len(self.HEADERS):
+            return self.HEADERS[section]
+        return str(section + 1)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+        if index.column() == 6:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        return flags
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row_index = index.row()
+        if row_index < 0 or row_index >= len(self.editor.data.rows):
+            return None
+        row = self.editor.data.rows[row_index]
+        mosaic_count = enabled_mosaic_count(row)
+
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            nsfw_detection_count = row.get("nsfw_detection_count") or "?"
+            values = [
+                row.get("frame_no", ""),
+                "T" if self.editor.row_modified(row_index) else "F",
+                "keep" if self.editor.frame_is_kept(row, self._keep_ranges) else "cut",
+                self.editor.person_count_for_row(row),
+                f"{mosaic_count}/{nsfw_detection_count}",
+                "yes" if is_on(row.get("crotch_detected")) else "none",
+                row.get("comment", ""),
+            ]
+            return values[index.column()]
+
+        if role == Qt.ItemDataRole.BackgroundRole:
+            if not self.editor.frame_is_kept(row, self._keep_ranges):
+                return QColor(205, 205, 205)
+            return QColor(255, 220, 230) if mosaic_count else QColor(232, 232, 232)
+
+        return None
+
+    def setData(self, index: QModelIndex, value, role: int = Qt.ItemDataRole.EditRole) -> bool:
+        if role != Qt.ItemDataRole.EditRole or not index.isValid() or index.column() != 6:
+            return False
+        row_index = index.row()
+        if row_index < 0 or row_index >= len(self.editor.data.rows):
+            return False
+        self.editor.data.rows[row_index]["comment"] = str(value).strip()
+        log_user_action(
+            "フレームコメント変更",
+            row=row_index,
+            frame=self.editor.data.rows[row_index].get("frame_no", ""),
+        )
+        self.editor.mark_dirty()
+        self.refresh_row(row_index)
+        return True
+
+    def refresh_all(self) -> None:
+        self._keep_ranges = self.editor.keep_ranges()
+        if self.rowCount() == 0:
+            return
+        top_left = self.index(0, 0)
+        bottom_right = self.index(self.rowCount() - 1, self.columnCount() - 1)
+        self.dataChanged.emit(top_left, bottom_right, [
+            Qt.ItemDataRole.DisplayRole,
+            Qt.ItemDataRole.EditRole,
+            Qt.ItemDataRole.BackgroundRole,
+        ])
+
+    def refresh_row(self, row_index: int) -> None:
+        if row_index < 0 or row_index >= self.rowCount():
+            return
+        self.refresh_rows(row_index, row_index)
+
+    def refresh_rows(self, start_row: int, end_row: int) -> None:
+        if self.rowCount() == 0:
+            return
+        start_row = max(0, min(self.rowCount() - 1, start_row))
+        end_row = max(0, min(self.rowCount() - 1, end_row))
+        if end_row < start_row:
+            start_row, end_row = end_row, start_row
+        top_left = self.index(start_row, 0)
+        bottom_right = self.index(end_row, self.columnCount() - 1)
+        self.dataChanged.emit(top_left, bottom_right, [
+            Qt.ItemDataRole.DisplayRole,
+            Qt.ItemDataRole.EditRole,
+            Qt.ItemDataRole.BackgroundRole,
+        ])
 
 
 def track_rect_template(
@@ -1297,6 +1550,40 @@ def track_rect(
     return flow_rect, score, "flow"
 
 
+def scale_rect(rect: QRect, scale: float) -> QRect:
+    return QRect(
+        round(rect.left() * scale),
+        round(rect.top() * scale),
+        max(1, round(rect.width() * scale)),
+        max(1, round(rect.height() * scale)),
+    )
+
+
+def track_rect_proxy(
+    prev_frame: np.ndarray,
+    next_frame: np.ndarray,
+    rect: QRect,
+    allow_scale: bool = True,
+    max_dim: int = TRACK_PROXY_MAX_DIM,
+) -> tuple[QRect, float, str] | None:
+    height, width = prev_frame.shape[:2]
+    scale = min(1.0, max_dim / max(1, max(width, height)))
+    if scale >= 0.999:
+        return track_rect(prev_frame, next_frame, rect, allow_scale=allow_scale)
+
+    proxy_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    prev_proxy = cv2.resize(prev_frame, proxy_size, interpolation=cv2.INTER_AREA)
+    next_proxy = cv2.resize(next_frame, proxy_size, interpolation=cv2.INTER_AREA)
+    proxy_rect = scale_rect(rect, scale)
+    result = track_rect(prev_proxy, next_proxy, proxy_rect, allow_scale=allow_scale)
+    if result is None:
+        return None
+    tracked_proxy_rect, score, method = result
+    inv_scale = 1.0 / scale
+    tracked_rect = scale_rect(tracked_proxy_rect, inv_scale)
+    return tracked_rect, score, f"{method}:proxy"
+
+
 def interpolate_rect(start: QRect, end: QRect, t: float) -> QRect:
     x = round(start.left() + (end.left() - start.left()) * t)
     y = round(start.top() + (end.top() - start.top()) * t)
@@ -1388,6 +1675,7 @@ class SequenceSlider(QSlider):
         self.frame_numbers = frame_numbers
         self.keep_ranges: list[tuple[int, int]] = []
         self.person_ranges: list[tuple[int, int, int]] = []
+        self.modified_ranges: list[tuple[int, int]] = []
         self.keep_start_marker: int | None = None
         self.keep_end_marker: int | None = None
         self.jump_dragging = False
@@ -1396,12 +1684,12 @@ class SequenceSlider(QSlider):
         self.setStyleSheet(
             """
             QSlider::groove:horizontal {
-                height: 8px;
+                height: 4px;
                 background: transparent;
             }
             QSlider::handle:horizontal {
-                width: 5px;
-                margin: -7px 0;
+                width: 1px;
+                margin: -9px 0;
                 background: #0068c9;
                 border: 1px solid #004b91;
             }
@@ -1416,6 +1704,10 @@ class SequenceSlider(QSlider):
         self.person_ranges = person_ranges
         self.update()
 
+    def set_modified_ranges(self, modified_ranges: list[tuple[int, int]]) -> None:
+        self.modified_ranges = modified_ranges
+        self.update()
+
     def set_keep_markers(self, start_frame: int | None, end_frame: int | None) -> None:
         self.keep_start_marker = start_frame
         self.keep_end_marker = end_frame
@@ -1428,6 +1720,18 @@ class SequenceSlider(QSlider):
         if index > 0 and frame_no - self.frame_numbers[index - 1] < self.frame_numbers[index] - frame_no:
             return index - 1
         return index
+
+    def frame_tick_step(self) -> int:
+        if not self.frame_numbers:
+            return 100
+        span = max(1, self.frame_numbers[-1] - self.frame_numbers[0])
+        rough_step = max(1, span / 10)
+        magnitude = 10 ** math.floor(math.log10(rough_step))
+        for multiplier in (1, 2, 5, 10):
+            step = int(multiplier * magnitude)
+            if step >= rough_step:
+                return max(1, step)
+        return max(1, int(10 * magnitude))
 
     def paintEvent(self, event) -> None:
         self.paint_trim_ranges()
@@ -1447,7 +1751,13 @@ class SequenceSlider(QSlider):
         painter.setPen(QPen(QColor("#505050")))
         first_frame = self.frame_numbers[0]
         last_frame = self.frame_numbers[-1]
-        for frame_no in range(first_frame, last_frame + 1, 100):
+        tick_step = self.frame_tick_step()
+        first_tick = ((first_frame + tick_step - 1) // tick_step) * tick_step
+        tick_frames = [first_frame]
+        tick_frames.extend(range(first_tick, last_frame + 1, tick_step))
+        if tick_frames[-1] != last_frame:
+            tick_frames.append(last_frame)
+        for frame_no in dict.fromkeys(tick_frames):
             position = QStyle.sliderPositionFromValue(
                 self.minimum(),
                 self.maximum(),
@@ -1465,6 +1775,7 @@ class SequenceSlider(QSlider):
                 alignment = Qt.AlignmentFlag.AlignRight
             painter.drawText(label_x, 29, 80, 13, alignment, str(frame_no))
         self.paint_person_ranges(painter, option, handle)
+        self.paint_modified_ranges(painter, option, handle)
         self.paint_keep_markers(painter, option, handle)
 
     def paint_trim_ranges(self) -> None:
@@ -1580,6 +1891,38 @@ class SequenceSlider(QSlider):
             line_left = min(self.width() - 1, left + 14)
             line_right = max(line_left + 8, right)
             painter.drawLine(line_left, y, min(self.width() - 1, line_right), y)
+
+    def paint_modified_ranges(self, painter: QPainter, option: QStyleOptionSlider, handle: QRect) -> None:
+        if not self.frame_numbers or not self.modified_ranges:
+            return
+        slider_max = max(1, self.width() - handle.width())
+        left_offset = handle.width() // 2
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+
+        def frame_to_x(frame_no: int) -> int:
+            index = self.tick_index(frame_no)
+            position = QStyle.sliderPositionFromValue(
+                self.minimum(),
+                self.maximum(),
+                max(self.minimum(), min(self.maximum(), index)),
+                slider_max,
+                upsideDown=option.upsideDown,
+            )
+            return position + left_offset
+
+        painter.setPen(QPen(QColor(220, 40, 40), 3))
+        y = min(self.height() - 1, groove.bottom() + 3)
+        for start_frame, end_frame in self.modified_ranges:
+            left = frame_to_x(start_frame)
+            right = frame_to_x(end_frame)
+            if right < left:
+                left, right = right, left
+            painter.drawLine(left, y, max(left + 2, right), y)
 
     def mousePressEvent(self, event) -> None:
         option = QStyleOptionSlider()
@@ -1933,6 +2276,17 @@ class EditorWindow(QMainWindow):
 
     def load_csv(self, csv_path: Path) -> None:
         APP_LOGGER.info("CSV読込開始: %s", csv_path)
+        progress = self.reusable_progress_dialog("読み込み中", "レシピファイルを読み込み中...", 100)
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        def set_load_progress(message: str, value: int) -> None:
+            progress.setLabelText(message)
+            progress.setValue(max(0, min(100, value)))
+            progress.show()
+            QApplication.processEvents()
+
         if hasattr(self, "playback_active") and self.playback_active:
             self.stop_preview_playback()
         if hasattr(self, "slider_load_timer"):
@@ -1946,8 +2300,16 @@ class EditorWindow(QMainWindow):
             old_central.deleteLater()
         self.menuBar().clear()
         self.csv_path = csv_path
-        self.data = read_pre_csv(csv_path)
+        set_load_progress("レシピファイルを読み込み中...", 1)
+
+        def on_csv_progress(current: int, total: int) -> None:
+            ratio = current / max(1, total)
+            set_load_progress(f"レシピファイルを読み込み中... {int(ratio * 100)}%", 1 + round(ratio * 69))
+
+        self.data = read_pre_csv(csv_path, progress_callback=on_csv_progress)
+        set_load_progress("読み込みデータを準備中...", 72)
         self.original_rows = [dict(row) for row in self.data.rows]
+        set_load_progress("元動画を確認中...", 76)
         self.video_path = source_video_path(self.data, self.csv_path)
         if not self.video_path.is_file():
             APP_LOGGER.error("元動画が見つかりません: csv=%s video=%s", self.csv_path, self.video_path)
@@ -1956,6 +2318,7 @@ class EditorWindow(QMainWindow):
         if not self.cap.isOpened():
             APP_LOGGER.error("動画を開けません: csv=%s video=%s", self.csv_path, self.video_path)
             raise RuntimeError(f"動画を開けません: {self.video_path}")
+        self.video_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.current_index = 0
         self.selected_slot = 1
         self.dirty = False
@@ -1984,8 +2347,13 @@ class EditorWindow(QMainWindow):
         self.playback_active = False
 
         self.setWindowTitle(f"pre CSV Editor - {csv_path.name}")
+        set_load_progress("画面を構築中...", 82)
         self.build_ui(show_load_progress=True)
+        set_load_progress("先頭フレームを読み込み中...", 96)
         self.load_frame()
+        set_load_progress("読み込み完了", 100)
+        progress.hide()
+        self.remember_recipe_path(csv_path)
         APP_LOGGER.info("CSV読込完了: csv=%s rows=%s video=%s", csv_path, len(self.data.rows), self.video_path)
 
     def build_ui(self, show_load_progress: bool = False) -> None:
@@ -2095,6 +2463,7 @@ class EditorWindow(QMainWindow):
         self.sequence_slider.setRange(0, max(0, len(self.data.rows) - 1))
         self.sequence_slider.set_keep_ranges(self.keep_ranges())
         self.sequence_slider.set_person_ranges(self.person_ranges())
+        self.sequence_slider.set_modified_ranges(self.modified_ranges())
         left_layout.addWidget(self.sequence_slider)
 
         nav = QHBoxLayout()
@@ -2159,13 +2528,16 @@ class EditorWindow(QMainWindow):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
 
-        self.frame_table = QTableWidget(len(self.data.rows), 7)
-        self.frame_table.setHorizontalHeaderLabels(
-            ["frame_no", "modify", "Keep", "Persons", "Mosaic", "Crotch", "comment"]
-        )
-        self.frame_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.frame_table_model = FrameTableModel(self)
+        self.frame_table = QTableView()
+        self.frame_table.setModel(self.frame_table_model)
+        self.frame_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.frame_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.frame_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.frame_table.horizontalHeader().setStretchLastSection(True)
         self.frame_table.verticalHeader().setVisible(False)
+        for col, width in enumerate((86, 56, 56, 64, 76, 64, 180)):
+            self.frame_table.setColumnWidth(col, width)
         right_layout.addWidget(QLabel("CSV行"))
         right_layout.addWidget(self.frame_table, stretch=1)
 
@@ -2225,9 +2597,8 @@ class EditorWindow(QMainWindow):
         self.type_input.editingFinished.connect(self.update_selected_type)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
-        self.frame_table.cellClicked.connect(self.select_frame_row)
-        self.frame_table.itemSelectionChanged.connect(self.select_selected_frame_row)
-        self.frame_table.itemChanged.connect(self.update_frame_from_table)
+        self.frame_table.clicked.connect(self.select_frame_row)
+        self.frame_table.selectionModel().selectionChanged.connect(self.select_selected_frame_row)
         self.populate_frame_table(
             show_progress=show_load_progress,
             progress_message="レシピファイルを読み込み中...",
@@ -2246,6 +2617,14 @@ class EditorWindow(QMainWindow):
         open_action = QAction("レシピを開く", self)
         open_action.triggered.connect(self.open_recipe_from_menu)
         menu.addAction(open_action)
+
+        last_csv = self.last_recipe_path()
+        reopen_action = QAction("前回のレシピを開く", self)
+        reopen_action.triggered.connect(self.open_last_recipe)
+        reopen_action.setEnabled(last_csv is not None)
+        if last_csv is not None:
+            reopen_action.setToolTip(str(last_csv))
+        menu.addAction(reopen_action)
 
         save_action = QAction("レシピを保存", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
@@ -2283,22 +2662,47 @@ class EditorWindow(QMainWindow):
 
     def open_recipe_from_menu(self) -> None:
         log_user_action("メニュー レシピを開く")
-        selected, _ = QFileDialog.getOpenFileName(self, "_pre.csv を選択", "", "CSV (*.csv)")
+        last_csv = self.last_recipe_path()
+        start_dir = str(last_csv.parent) if last_csv is not None else ""
+        selected, _ = QFileDialog.getOpenFileName(self, "_pre.csv を選択", start_dir, "CSV (*.csv)")
         if selected:
             log_user_action("レシピ選択", path=selected)
             self.open_editor_window(Path(selected))
+
+    def last_recipe_path(self) -> Path | None:
+        path_text = config_text(load_editor_config(), "last_recipe_path", "").strip()
+        if not path_text:
+            return None
+        path = Path(path_text).expanduser()
+        return path if path.is_file() else None
+
+    def remember_recipe_path(self, csv_path: Path) -> None:
+        try:
+            save_editor_config_value("last_recipe_path", str(csv_path.resolve()))
+        except Exception:
+            APP_LOGGER.exception("前回レシピパスを保存できません: %s", csv_path)
+
+    def open_last_recipe(self) -> None:
+        last_csv = self.last_recipe_path()
+        if last_csv is None:
+            QMessageBox.information(self, "未設定", "前回開いたレシピが見つかりません。")
+            return
+        log_user_action("前回レシピを開く", path=last_csv)
+        self.open_editor_window(last_csv)
 
     def open_editor_window(self, csv_path: Path) -> None:
         log_user_action("レシピを開く", csv_path=csv_path)
         if self.csv_path is None:
             try:
                 self.load_csv(csv_path)
+                self.remember_recipe_path(csv_path)
             except Exception as exc:
                 APP_LOGGER.exception("レシピを開けません: %s", csv_path)
                 QMessageBox.critical(self, "Error", str(exc))
             return
         try:
             window = EditorWindow(csv_path)
+            self.remember_recipe_path(csv_path)
         except Exception as exc:
             APP_LOGGER.exception("別ウィンドウでレシピを開けません: %s", csv_path)
             QMessageBox.critical(self, "Error", str(exc))
@@ -2321,6 +2725,7 @@ class EditorWindow(QMainWindow):
         self.dirty = True
         if not self.windowTitle().endswith("*"):
             self.setWindowTitle(self.windowTitle() + " *")
+        self.refresh_modified_markers()
 
     def reusable_progress_dialog(self, title: str, label: str, maximum: int) -> QProgressDialog:
         if self.progress_dialog is None:
@@ -2358,6 +2763,9 @@ class EditorWindow(QMainWindow):
         QApplication.processEvents()
 
     def load_frame(self) -> None:
+        self.load_frame_with_options(skip_pose_overlay=False, fast_seek=False)
+
+    def load_frame_with_options(self, skip_pose_overlay: bool = False, fast_seek: bool = False) -> None:
         self.pending_slider_index = None
         frame_no_text = self.current_row().get("frame_no", "")
         try:
@@ -2366,7 +2774,7 @@ class EditorWindow(QMainWindow):
             APP_LOGGER.warning("frame_no が不正です: index=%s value=%s", self.current_index, frame_no_text)
             QMessageBox.warning(self, "Error", f"frame_no が不正です: {frame_no_text}")
             return
-        frame = self.read_frame_number(frame_no, prefer_sequential=True)
+        frame = self.read_frame_number(frame_no, prefer_sequential=True, fast_seek=fast_seek)
         if frame is None:
             APP_LOGGER.warning("フレームを読めません: frame_no=%s video=%s", frame_no, self.video_path)
             QMessageBox.warning(self, "Error", f"フレームを読めません: frame_no={frame_no}")
@@ -2375,16 +2783,14 @@ class EditorWindow(QMainWindow):
         h, w = frame.shape[:2]
         self.image_width = w
         self.image_height = h
-        self.refresh_canvas_frame()
+        self.refresh_canvas_frame(skip_pose_overlay=skip_pose_overlay)
         self.frame_label.setText(f"{self.current_index + 1}/{len(self.data.rows)}")
         self.frame_input.setText(str(frame_no))
         self.sequence_slider.blockSignals(True)
         self.sequence_slider.setValue(self.current_index)
         self.sequence_slider.blockSignals(False)
-        if get_rect(self.current_row(), self.selected_slot) is None:
-            self.populate_selected_from_nearest(on=False)
         self.select_current_frame_row()
-        self.refresh_mosaic_table()
+        self.refresh_mosaic_table(skip_pose_overlay=skip_pose_overlay)
 
     def update_frame_position_labels(self) -> None:
         row = self.current_row()
@@ -2408,9 +2814,9 @@ class EditorWindow(QMainWindow):
             return
         if self.current_index != target_index:
             self.current_index = target_index
-        self.load_frame()
+        self.load_frame_with_options(skip_pose_overlay=True, fast_seek=False)
 
-    def read_frame_number(self, frame_no: int, prefer_sequential: bool) -> np.ndarray | None:
+    def read_frame_number(self, frame_no: int, prefer_sequential: bool, fast_seek: bool = False) -> np.ndarray | None:
         if self.cap is None:
             return None
         can_read_forward = (
@@ -2420,6 +2826,11 @@ class EditorWindow(QMainWindow):
             and frame_no - self.display_cap_pos <= DISPLAY_SEQUENTIAL_MAX_SKIP
         )
         if not can_read_forward:
+            if fast_seek:
+                frame = self.read_frame_number_fast_seek(frame_no)
+                if frame is not None:
+                    self.display_cap_pos = None
+                    return frame
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
             self.display_cap_pos = frame_no
 
@@ -2432,7 +2843,62 @@ class EditorWindow(QMainWindow):
             self.display_cap_pos += 1
         return frame
 
-    def refresh_canvas_frame(self, *args) -> None:
+    def read_frame_number_fast_seek(self, frame_no: int) -> np.ndarray | None:
+        if shutil.which("ffmpeg") is None:
+            return None
+        fps = self.video_fps if getattr(self, "video_fps", 0) and self.video_fps > 0 else 30.0
+        target_sec = max(0.0, frame_no / fps)
+        pre_seek_sec = max(0.0, target_sec - FAST_SEEK_PREROLL_SEC)
+        inner_seek_sec = target_sec - pre_seek_sec
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{pre_seek_sec:.6f}",
+            "-i",
+            str(self.video_path),
+            "-ss",
+            f"{inner_seek_sec:.6f}",
+            "-frames:v",
+            "1",
+            "-an",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]
+        started_at = time.monotonic()
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=FAST_SEEK_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            APP_LOGGER.warning("ffmpeg高速シークがタイムアウト: frame=%s", frame_no)
+            return None
+        elapsed = time.monotonic() - started_at
+        if proc.returncode != 0 or not proc.stdout:
+            APP_LOGGER.warning(
+                "ffmpeg高速シーク失敗: frame=%s returncode=%s stderr=%s",
+                frame_no,
+                proc.returncode,
+                proc.stderr.decode("utf-8", errors="replace")[:500],
+            )
+            return None
+        image = cv2.imdecode(np.frombuffer(proc.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            APP_LOGGER.warning("ffmpeg高速シーク画像デコード失敗: frame=%s", frame_no)
+            return None
+        APP_LOGGER.info("ffmpeg高速シーク完了: frame=%s elapsed=%.3f", frame_no, elapsed)
+        return image
+
+    def refresh_canvas_frame(self, *args, skip_pose_overlay: bool = False) -> None:
         if self.source_frame is None:
             return
         frame = self.source_frame.copy()
@@ -2452,7 +2918,7 @@ class EditorWindow(QMainWindow):
                     apply_preview_effect(frame, rect, intensity, effect, shape)
         draw_crotch = self.crotch_overlay_checkbox.isChecked()
         draw_skeleton = self.skeleton_overlay_checkbox.isChecked()
-        if draw_crotch or draw_skeleton:
+        if (draw_crotch or draw_skeleton) and not skip_pose_overlay:
             overlay = self.current_pose_overlay()
             if overlay is not None:
                 crotch_boxes, pose_keypoints = overlay
@@ -2634,11 +3100,9 @@ class EditorWindow(QMainWindow):
         progress_offset: int = 0,
         progress_total: int | None = None,
     ) -> None:
-        keep_ranges = self.keep_ranges()
-        owns_progress = False
-        start_time = time.monotonic()
         total = len(self.data.rows)
         progress_total = progress_total or total
+        owns_progress = False
         if show_progress:
             if progress is None:
                 progress = self.reusable_progress_dialog("処理中", progress_message, max(1, progress_total))
@@ -2646,33 +3110,50 @@ class EditorWindow(QMainWindow):
             else:
                 progress.setRange(0, max(1, progress_total))
                 progress.setLabelText(progress_message)
-                progress.setValue(progress_offset)
                 progress.show()
-                QApplication.processEvents()
-        self.frame_table.blockSignals(True)
-        try:
-            for idx, row in enumerate(self.data.rows):
-                self.update_frame_table_row(idx, row, keep_ranges)
-                if progress is not None and (idx % 20 == 0 or idx + 1 == total):
-                    done = idx + 1
-                    self.update_progress_dialog(
-                        progress,
-                        progress_message,
-                        min(progress_total, progress_offset + done),
-                        progress_total,
-                        start_time,
-                    )
-        finally:
-            self.frame_table.blockSignals(False)
-            if progress is not None and owns_progress:
-                progress.setValue(max(1, progress_total))
-                progress.hide()
+            progress.setValue(min(progress_total, progress_offset + total))
+            QApplication.processEvents()
+        self.frame_table_model.refresh_all()
+        if progress is not None and owns_progress:
+            progress.setValue(max(1, progress_total))
+            progress.hide()
         self.sequence_slider.set_person_ranges(self.person_ranges())
+        self.sequence_slider.set_modified_ranges(self.modified_ranges())
 
     def row_modified(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.original_rows):
             return False
         return self.data.rows[idx] != self.original_rows[idx]
+
+    def modified_ranges(self) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        current_start: int | None = None
+        current_end: int | None = None
+        for idx, row in enumerate(self.data.rows):
+            if not self.row_modified(idx):
+                if current_start is not None and current_end is not None:
+                    ranges.append((current_start, current_end))
+                current_start = None
+                current_end = None
+                continue
+            try:
+                frame_no = int(row.get("frame_no", ""))
+            except ValueError:
+                continue
+            if current_start is not None and current_end is not None and frame_no == current_end + 1:
+                current_end = frame_no
+                continue
+            if current_start is not None and current_end is not None:
+                ranges.append((current_start, current_end))
+            current_start = frame_no
+            current_end = frame_no
+        if current_start is not None and current_end is not None:
+            ranges.append((current_start, current_end))
+        return ranges
+
+    def refresh_modified_markers(self) -> None:
+        if hasattr(self, "sequence_slider"):
+            self.sequence_slider.set_modified_ranges(self.modified_ranges())
 
     def keep_ranges(self) -> list[tuple[int, int]]:
         try:
@@ -2736,33 +3217,7 @@ class EditorWindow(QMainWindow):
         row: dict[str, str],
         keep_ranges: list[tuple[int, int]] | None = None,
     ) -> None:
-        mosaic_count = enabled_mosaic_count(row)
-        nsfw_detection_count = row.get("nsfw_detection_count") or "?"
-        persons = self.person_count_for_row(row)
-        kept = self.frame_is_kept(row, keep_ranges)
-        values = [
-            row.get("frame_no", ""),
-            "T" if self.row_modified(idx) else "F",
-            "keep" if kept else "cut",
-            persons,
-            f"{mosaic_count}/{nsfw_detection_count}",
-            "yes" if is_on(row.get("crotch_detected")) else "none",
-            row.get("comment", ""),
-        ]
-        if not kept:
-            background = QColor(205, 205, 205)
-        else:
-            background = QColor(255, 220, 230) if mosaic_count else QColor(232, 232, 232)
-        self.frame_table.blockSignals(True)
-        try:
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setBackground(background)
-                if col != 6:
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.frame_table.setItem(idx, col, item)
-        finally:
-            self.frame_table.blockSignals(False)
+        self.frame_table_model.refresh_row(idx)
 
     def person_count_for_row(self, row: dict[str, str]) -> str:
         person_count = row.get("person_count")
@@ -2779,12 +3234,13 @@ class EditorWindow(QMainWindow):
         return str(len(pose_keypoints))
 
     def select_current_frame_row(self) -> None:
-        self.frame_table.blockSignals(True)
+        selection_model = self.frame_table.selectionModel()
+        selection_model.blockSignals(True)
         self.frame_table.selectRow(self.current_index)
-        self.frame_table.scrollToItem(self.frame_table.item(self.current_index, 0))
-        self.frame_table.blockSignals(False)
+        self.frame_table.scrollTo(self.frame_table_model.index(self.current_index, 0))
+        selection_model.blockSignals(False)
 
-    def refresh_mosaic_table(self) -> None:
+    def refresh_mosaic_table(self, skip_pose_overlay: bool = False) -> None:
         row = self.current_row()
         visible_slots = self.visible_mosaic_slots(row)
         self.mosaic_table.blockSignals(True)
@@ -2821,7 +3277,7 @@ class EditorWindow(QMainWindow):
         self.mosaic_table.scrollToItem(self.mosaic_table.item(selected_row, 0))
         self.type_input.setText(row.get(f"mosaic{self.selected_slot}_type", ""))
         self.update_frame_table_row(self.current_index, row)
-        self.refresh_canvas_frame()
+        self.refresh_canvas_frame(skip_pose_overlay=skip_pose_overlay)
         self.canvas.update()
 
     def visible_mosaic_slots(self, row: dict[str, str]) -> list[int]:
@@ -2935,15 +3391,8 @@ class EditorWindow(QMainWindow):
         log_user_action("モザイク表編集", frame=self.current_frame_no(), slot=slot, key=key, value=value)
         self.refresh_mosaic_table()
 
-    def update_frame_from_table(self, item: QTableWidgetItem) -> None:
-        if item.column() != 6:
-            return
-        self.data.rows[item.row()]["comment"] = item.text().strip()
-        log_user_action("フレームコメント変更", row=item.row(), frame=self.data.rows[item.row()].get("frame_no", ""))
-        self.mark_dirty()
-        self.update_frame_table_row(item.row(), self.data.rows[item.row()])
-
-    def select_frame_row(self, row: int, col: int) -> None:
+    def select_frame_row(self, index: QModelIndex) -> None:
+        row = index.row()
         if 0 <= row < len(self.data.rows):
             self.move_to_index(row)
 
@@ -3085,6 +3534,7 @@ class EditorWindow(QMainWindow):
                 self.data.rows[row_index] = dict(self.original_rows[row_index])
                 self.update_frame_table_row(row_index, self.data.rows[row_index])
         self.mark_dirty()
+        self.refresh_modified_markers()
         self.load_frame()
         self.refresh_mosaic_table()
 
@@ -3267,26 +3717,71 @@ class EditorWindow(QMainWindow):
             self.refresh_mosaic_table()
             return
 
-        original_index = self.current_index
-        self.current_index = start_index
-        self.load_frame()
+        anchor_frame = self.frame_at_index(start_index)
+        if anchor_frame is None:
+            APP_LOGGER.warning("範囲追跡失敗: Start frame を読めません slot=%s start=%s", slot, start_frame)
+            self.trace_slots.discard(slot)
+            self.auto_track_status.setText(f"mosaic{slot}: Start frame を読めません")
+            self.refresh_mosaic_table()
+            return
+        label = self.data.rows[start_index].get(f"mosaic{slot}_type", "") or "manual"
+        anchor_index = start_index
+        anchor_rect = QRect(start_rect)
         self.auto_track_status.setText(f"mosaic{slot}: {start_frame}-{end_frame} を追跡中...")
         QApplication.processEvents()
         stop_message = ""
         success_count = 0
+        updated_start: int | None = None
+        updated_end: int | None = None
         for target_index in range(start_index + 1, end_index + 1):
-            success, message = self.track_slot_to_index(
-                target_index,
-                slot,
-                stop_on_low_confidence=True,
-                refresh_anchor_from_current=success_count == 0,
-            )
-            if not success:
-                stop_message = message
-                APP_LOGGER.warning("範囲追跡停止: slot=%s message=%s", slot, message)
+            gap = target_index - anchor_index - 1
+            if gap > self.max_interpolate_gap():
+                stop_message = f"mosaic{slot}: gap超過"
+                APP_LOGGER.warning("範囲追跡停止: slot=%s message=%s", slot, stop_message)
                 break
+            frame_no_text = self.data.rows[target_index].get("frame_no", "")
+            try:
+                target_frame_no = int(frame_no_text)
+            except ValueError:
+                stop_message = f"mosaic{slot}: frame_no不正"
+                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                break
+            next_frame = self.read_frame_number(target_frame_no, prefer_sequential=True)
+            if next_frame is None:
+                stop_message = f"mosaic{slot}: フレーム読込失敗"
+                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                break
+            result = track_rect_proxy(
+                anchor_frame,
+                next_frame,
+                anchor_rect,
+                allow_scale=self.trace_scale_enabled(slot),
+            )
+            if result is None:
+                stop_message = f"mosaic{slot}: 失敗"
+                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                break
+            tracked_rect, score, method = result
+            if not self.track_confident_enough(score, method):
+                stop_message = f"mosaic{slot}: 見失い(score={score:.3f})"
+                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                break
+            tracked_rect = clamp_rect(tracked_rect, next_frame.shape[1], next_frame.shape[0])
+            span = max(1, target_index - anchor_index)
+            for idx in range(anchor_index + 1, target_index + 1):
+                t = (idx - anchor_index) / span
+                fill_rect = tracked_rect if idx == target_index else interpolate_rect(anchor_rect, tracked_rect, t)
+                target_row = self.data.rows[idx]
+                set_rect(target_row, slot, clamp_rect(fill_rect, next_frame.shape[1], next_frame.shape[0]), on=True)
+                target_row[f"mosaic{slot}_type"] = label
+                target_row[f"mosaic{slot}_score"] = f"track:{score:.3f}" if idx == target_index else "track:interpolated"
+                updated_start = idx if updated_start is None else min(updated_start, idx)
+                updated_end = idx if updated_end is None else max(updated_end, idx)
+            anchor_index = target_index
+            anchor_rect = QRect(tracked_rect)
+            anchor_frame = next_frame
             success_count += 1
-            if success_count % 10 == 0:
+            if success_count % 50 == 0:
                 frame_no = self.data.rows[target_index].get("frame_no", "")
                 self.auto_track_status.setText(f"mosaic{slot}: 範囲追跡中... frame {frame_no}")
                 QApplication.processEvents()
@@ -3296,7 +3791,10 @@ class EditorWindow(QMainWindow):
         self.auto_track_anchors.pop(slot, None)
         self.auto_track_status.setText(f"{stop_message} / 更新 {success_count} frame")
         log_user_action("範囲追跡終了", slot=slot, updated_frames=success_count, message=stop_message)
-        self.current_index = original_index
+        self.mark_dirty()
+        if updated_start is not None and updated_end is not None:
+            self.frame_table_model.refresh_rows(updated_start, updated_end)
+        self.refresh_modified_markers()
         self.load_frame()
 
     def track_confident_enough(self, score: float, method: str) -> bool:
@@ -3348,7 +3846,7 @@ class EditorWindow(QMainWindow):
         if self.csv_path is None:
             return
         total_rows = len(self.data.rows)
-        total_steps = max(1, total_rows * (2 if refresh_table else 1))
+        total_steps = max(1, total_rows * (3 if refresh_table else 2))
         started_at = time.monotonic()
         progress = None
         if progress_dialog is None:
@@ -3358,12 +3856,15 @@ class EditorWindow(QMainWindow):
 
         def on_write_progress(current: int, total: int) -> None:
             done = min(total_steps, current)
+            stage_message = "CSV列を確認中..." if current <= total // 2 else "CSVを書き込み中..."
             if progress_dialog is not None:
-                progress_dialog.set_stage_progress("CSVを書き込み中...", done, total_steps, started_at)
+                progress_dialog.set_stage_progress(stage_message, done, total_steps, started_at)
+                if progress_dialog.cancel_requested:
+                    raise EncodingCancelled("エンコードをキャンセルしました。")
             else:
                 self.update_progress_dialog(
                     progress,
-                    "CSVを書き込み中...",
+                    stage_message,
                     done,
                     total_steps,
                     started_at,
@@ -3374,12 +3875,15 @@ class EditorWindow(QMainWindow):
             self.original_rows = [dict(row) for row in self.data.rows]
             self.dirty = False
             self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
+            self.refresh_modified_markers()
+            if hasattr(self, "frame_table_model"):
+                self.frame_table_model.refresh_all()
             if refresh_table:
                 self.populate_frame_table(
                     show_progress=True,
                     progress_message="画面を更新中...",
                     progress=progress,
-                    progress_offset=total_rows,
+                    progress_offset=total_rows * 2,
                     progress_total=total_steps,
                 )
             if progress_dialog is not None:
@@ -3392,6 +3896,26 @@ class EditorWindow(QMainWindow):
             if progress is not None:
                 progress.hide()
 
+    def encode_estimate_text(self) -> str:
+        frame_total = len(self.data.rows)
+        try:
+            keep_ranges = self.keep_ranges()
+        except Exception:
+            keep_ranges = []
+        if keep_ranges:
+            frame_total = sum(end - start + 1 for start, end in keep_ranges)
+            frame_total = min(frame_total, len(self.data.rows))
+        fps = self.video_fps if getattr(self, "video_fps", 0) and self.video_fps > 0 else 30.0
+        video_seconds = frame_total / fps if fps > 0 else 0.0
+        estimate_min = video_seconds * 0.5
+        estimate_max = video_seconds * 1.5
+        return (
+            f"対象フレーム数: {frame_total}\n"
+            f"対象動画時間: 約 {format_duration(video_seconds)}\n"
+            f"予測時間: 約 {format_duration(estimate_min)} - {format_duration(estimate_max)}\n\n"
+            "エンコードしますか？"
+        )
+
     def encode_post(self) -> None:
         if self.csv_path is None:
             APP_LOGGER.info("エンコード不可: レシピ未選択")
@@ -3400,6 +3924,16 @@ class EditorWindow(QMainWindow):
         log_user_action("エンコード開始要求", csv_path=self.csv_path)
         output_path = post_output_path_from_csv(self.csv_path)
         log_path = output_path.with_name(f"{output_path.stem}_log.txt")
+        result = QMessageBox.question(
+            self,
+            "エンコード確認",
+            self.encode_estimate_text(),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if result != QMessageBox.StandardButton.Ok:
+            log_user_action("エンコードキャンセル", csv_path=self.csv_path)
+            return
         self.encode_button.setEnabled(False)
         dialog = PostProgressDialog(self.csv_path, output_path, log_path, self)
         dialog.finished.connect(lambda _result: self.encode_button.setEnabled(True))
@@ -3411,6 +3945,11 @@ class EditorWindow(QMainWindow):
                 progress_dialog=dialog,
                 refresh_table=False,
             )
+        except EncodingCancelled as exc:
+            self.encode_button.setEnabled(True)
+            dialog.reject()
+            QMessageBox.information(self, "キャンセル", str(exc))
+            return
         except Exception as exc:
             self.encode_button.setEnabled(True)
             dialog.reject()

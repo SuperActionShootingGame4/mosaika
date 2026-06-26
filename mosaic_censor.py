@@ -64,6 +64,18 @@ POSE_BACKENDS = ("yolo11", "yolo8", "vitpose-h", "rtmpose", "rtmpose-wholebody")
 CENSOR_EFFECTS = ("mosaic", "blur")
 CENSOR_SHAPES = ("square", "circle")
 MAX_CSV_MOSAICS = 255
+BASE_CSV_FIELDS = ["frame_no", "person_count", "nsfw_detection_count", "crotch_detected", "comment"]
+MOSAIC_CSV_SUFFIXES = [
+    "on",
+    "type",
+    "score",
+    "crotch_no",
+    "crotch_center",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+]
 PERSON_SKIP_CONFIDENCE = 0.25
 PERSON_SKIP_IMAGE_SIZE = 320
 
@@ -817,20 +829,11 @@ def merge_audio_ranges_from_source(
     run_ffmpeg_with_progress(cmd, tmp_video_path, progress_callback, duration_sec)
 
 
-def mosaic_csv_header() -> list[str]:
-    header = ["frame_no", "person_count", "nsfw_detection_count", "crotch_detected", "comment"]
-    for i in range(1, MAX_CSV_MOSAICS + 1):
-        header.extend([
-            f"mosaic{i}_on",
-            f"mosaic{i}_type",
-            f"mosaic{i}_score",
-            f"mosaic{i}_crotch_no",
-            f"mosaic{i}_crotch_center",
-            f"mosaic{i}_x1",
-            f"mosaic{i}_y1",
-            f"mosaic{i}_x2",
-            f"mosaic{i}_y2",
-        ])
+def mosaic_csv_header(max_mosaics: int = MAX_CSV_MOSAICS) -> list[str]:
+    max_mosaics = max(0, min(MAX_CSV_MOSAICS, max_mosaics))
+    header = list(BASE_CSV_FIELDS)
+    for i in range(1, max_mosaics + 1):
+        header.extend(f"mosaic{i}_{suffix}" for suffix in MOSAIC_CSV_SUFFIXES)
     return header
 
 
@@ -841,7 +844,11 @@ def mosaic_csv_row(
     nsfw_detection_count: int = 0,
     detector_boxes: list[tuple[tuple[int, int, int, int], float, str]] | None = None,
     person_count: int = 0,
+    max_mosaics: int | None = None,
 ) -> dict[str, str | int]:
+    if max_mosaics is None:
+        max_mosaics = len(boxes)
+    max_mosaics = max(0, min(MAX_CSV_MOSAICS, max_mosaics))
     row: dict[str, str | int] = {
         "frame_no": frame_idx,
         "person_count": person_count,
@@ -849,7 +856,7 @@ def mosaic_csv_row(
         "crotch_detected": "1" if crotch_boxes else "0",
         "comment": "",
     }
-    for i in range(1, MAX_CSV_MOSAICS + 1):
+    for i in range(1, max_mosaics + 1):
         row[f"mosaic{i}_on"] = "0"
         row[f"mosaic{i}_type"] = ""
         row[f"mosaic{i}_score"] = ""
@@ -860,7 +867,7 @@ def mosaic_csv_row(
         row[f"mosaic{i}_x2"] = ""
         row[f"mosaic{i}_y2"] = ""
 
-    for i, (box, label) in enumerate(boxes[:MAX_CSV_MOSAICS], start=1):
+    for i, (box, label) in enumerate(boxes[:max_mosaics], start=1):
         row[f"mosaic{i}_on"] = "1"
         row[f"mosaic{i}_type"] = label
         matching_scores = [
@@ -966,7 +973,7 @@ def create_blank_pre_csv(
             no_crotch,
             skip_no_person,
         )
-        writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header())
+        writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header(0))
         writer.writeheader()
         for index, frame_idx in enumerate(range(start_frame, end_frame + 1), start=1):
             writer.writerow(mosaic_csv_row(frame_idx, [], []))
@@ -1151,7 +1158,8 @@ def process_video(
     previous_positive_boxes: list[tuple[tuple[int, int, int, int], str]] = []
     previous_positive_idx: int | None = None
     csv_file = None
-    csv_writer = None
+    csv_rows: list[dict[str, str | int]] = []
+    csv_max_mosaics = 0
     resolved_input_path = str(Path(input_path).resolve())
     if csv_path:
         csv_file = open(csv_path, "w", encoding="utf-8", newline="")
@@ -1170,8 +1178,6 @@ def process_video(
             no_crotch,
             skip_no_person,
         )
-        csv_writer = csv.DictWriter(csv_file, fieldnames=mosaic_csv_header())
-        csv_writer.writeheader()
 
     def _write_out(
         frm: np.ndarray,
@@ -1183,14 +1189,18 @@ def process_video(
         nsfw_detection_count: int,
         fidx: int,
     ) -> None:
-        if csv_writer:
-            csv_writer.writerow(mosaic_csv_row(
+        nonlocal csv_max_mosaics
+        if csv_file:
+            row_mosaic_count = min(MAX_CSV_MOSAICS, len(apply_bxs))
+            csv_max_mosaics = max(csv_max_mosaics, row_mosaic_count)
+            csv_rows.append(mosaic_csv_row(
                 fidx,
                 apply_bxs,
                 srch_bxs,
                 nsfw_detection_count,
                 nnet_bxs,
                 person_count=len(pose_res),
+                max_mosaics=row_mosaic_count,
             ))
         if writer is None and debug_writer is None:
             return
@@ -1392,6 +1402,13 @@ def process_video(
         if debug_writer:
             debug_writer.release()
         if csv_file:
+            csv_writer = csv.DictWriter(
+                csv_file,
+                fieldnames=mosaic_csv_header(csv_max_mosaics),
+                extrasaction="ignore",
+            )
+            csv_writer.writeheader()
+            csv_writer.writerows(csv_rows)
             csv_file.close()
 
     if tmp_video_path and output_path:
