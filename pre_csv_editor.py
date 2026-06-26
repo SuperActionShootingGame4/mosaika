@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -91,10 +92,11 @@ DEFAULT_INTENSITY_SLIDER_MAX = 100
 MIN_ZOOM = 0.25
 MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
-TRACE_TO_END_MIN_SCORE = 0.35
+DEFAULT_TRACE_TO_END_MIN_SCORE = 0.35
 POSE_OVERLAY_MIN_SCORE = 0.3
 FRAME_SLIDER_LOAD_DELAY_MS = 35
 TRACK_PROXY_MAX_DIM = 640
+TRACE_ORIGINAL_TEMPLATE_INTERVAL = 10
 
 APP_LOGGER = logging.getLogger("pre_csv_editor")
 APP_LOG_FILE_HANDLE = None
@@ -1584,6 +1586,52 @@ def track_rect_proxy(
     return tracked_rect, score, f"{method}:proxy"
 
 
+def template_similarity_score(
+    template_frame: np.ndarray,
+    template_rect: QRect,
+    target_frame: np.ndarray,
+    target_rect: QRect,
+) -> float | None:
+    template_rect = template_rect.normalized()
+    target_rect = target_rect.normalized()
+    template_x, template_y, template_w, template_h = rect_to_xywh(template_rect)
+    target_x, target_y, target_w, target_h = rect_to_xywh(target_rect)
+    if min(template_w, template_h, target_w, target_h) < 4:
+        return None
+    template_frame_h, template_frame_w = template_frame.shape[:2]
+    target_frame_h, target_frame_w = target_frame.shape[:2]
+    if (
+        template_x < 0
+        or template_y < 0
+        or template_x + template_w > template_frame_w
+        or template_y + template_h > template_frame_h
+        or target_x < 0
+        or target_y < 0
+        or target_x + target_w > target_frame_w
+        or target_y + target_h > target_frame_h
+    ):
+        return None
+
+    template = cv2.cvtColor(
+        template_frame[template_y:template_y + template_h, template_x:template_x + template_w],
+        cv2.COLOR_BGR2GRAY,
+    )
+    target = cv2.cvtColor(
+        target_frame[target_y:target_y + target_h, target_x:target_x + target_w],
+        cv2.COLOR_BGR2GRAY,
+    )
+    if template.size == 0 or target.size == 0:
+        return None
+    resized_template = cv2.resize(template, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    if float(resized_template.std()) < 1.0:
+        return None
+    if float(target.std()) < 1.0:
+        return 0.0
+    result = cv2.matchTemplate(target, resized_template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, _ = cv2.minMaxLoc(result)
+    return float(score) if np.isfinite(score) else None
+
+
 def interpolate_rect(start: QRect, end: QRect, t: float) -> QRect:
     x = round(start.left() + (end.left() - start.left()) * t)
     y = round(start.top() + (end.top() - start.top()) * t)
@@ -2329,6 +2377,13 @@ class EditorWindow(QMainWindow):
         self.trace_slots: set[int] = set()
         self.trace_scale_slots: set[int] = set()
         self.trace_ranges: dict[int, tuple[int, int]] = {}
+        self.trace_min_score = config_float(
+            load_editor_config(),
+            "trace_min_score",
+            DEFAULT_TRACE_TO_END_MIN_SCORE,
+            0.0,
+            1.0,
+        )
         self.auto_track_anchors: dict[int, tuple[int, QRect, np.ndarray, str]] = {}
         self.pose_model_bundle = None
         self.pose_model_error: str | None = None
@@ -2521,9 +2576,16 @@ class EditorWindow(QMainWindow):
         intensity_layout.setContentsMargins(0, 0, 0, 0)
         intensity_layout.addWidget(self.intensity_spin)
         intensity_layout.addWidget(self.intensity_slider, stretch=1)
+        self.trace_min_score_spin = QDoubleSpinBox()
+        self.trace_min_score_spin.setRange(0.0, 1.0)
+        self.trace_min_score_spin.setDecimals(2)
+        self.trace_min_score_spin.setSingleStep(0.05)
+        self.trace_min_score_spin.setFixedWidth(70)
+        self.trace_min_score_spin.setValue(self.trace_min_score)
         meta_layout.addRow("intensity", intensity_layout)
         meta_layout.addRow("effect", self.effect_combo)
         meta_layout.addRow("shape", self.shape_combo)
+        meta_layout.addRow("Trace min score", self.trace_min_score_spin)
         for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch", "skip_no_person"):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
@@ -2594,6 +2656,7 @@ class EditorWindow(QMainWindow):
         self.intensity_slider.valueChanged.connect(self.intensity_spin.setValue)
         self.intensity_spin.valueChanged.connect(self.sync_intensity_slider)
         self.intensity_spin.valueChanged.connect(self.update_preview_meta)
+        self.trace_min_score_spin.valueChanged.connect(self.update_trace_min_score)
         self.type_input.editingFinished.connect(self.update_selected_type)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
@@ -2727,15 +2790,19 @@ class EditorWindow(QMainWindow):
             self.setWindowTitle(self.windowTitle() + " *")
         self.refresh_modified_markers()
 
-    def reusable_progress_dialog(self, title: str, label: str, maximum: int) -> QProgressDialog:
+    def reusable_progress_dialog(self, title: str, label: str, maximum: int, cancelable: bool = False) -> QProgressDialog:
         if self.progress_dialog is None:
             self.progress_dialog = QProgressDialog(self)
-            self.progress_dialog.setCancelButton(None)
             self.progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
             self.progress_dialog.setMinimumDuration(0)
             self.progress_dialog.setAutoClose(False)
             self.progress_dialog.setAutoReset(False)
         progress = self.progress_dialog
+        progress.reset()
+        if cancelable:
+            progress.setCancelButtonText("Cancel")
+        else:
+            progress.setCancelButton(None)
         progress.setWindowTitle(title)
         progress.setLabelText(label)
         progress.setRange(0, max(1, maximum))
@@ -3306,6 +3373,14 @@ class EditorWindow(QMainWindow):
     def trace_scale_enabled(self, slot: int) -> bool:
         return slot in self.trace_scale_slots
 
+    def update_trace_min_score(self, value: float) -> None:
+        self.trace_min_score = float(value)
+        try:
+            save_editor_config_value("trace_min_score", self.trace_min_score)
+        except Exception:
+            APP_LOGGER.exception("追跡スコア閾値を保存できません: value=%s", value)
+        log_user_action("追跡スコア閾値変更", value=self.trace_min_score)
+
     def frame_index_for_no(self, frame_no: int) -> int | None:
         for idx, row in enumerate(self.data.rows):
             try:
@@ -3326,11 +3401,7 @@ class EditorWindow(QMainWindow):
         col = item.column()
         if col == 1:
             if is_on(item.text()):
-                self.trace_slots.add(slot)
-                self.selected_slot = slot
-                self.refresh_mosaic_table()
-                log_user_action("追跡開始", frame=self.current_frame_no(), slot=slot, source="table")
-                self.trace_slot_range(slot)
+                self.start_trace_with_length(slot, source="table")
             else:
                 self.trace_slots.discard(slot)
                 self.auto_track_anchors.pop(slot, None)
@@ -3433,10 +3504,7 @@ class EditorWindow(QMainWindow):
                 log_user_action("追跡解除", frame=self.current_frame_no(), slot=self.selected_slot, source="click")
                 self.refresh_mosaic_table()
             else:
-                self.trace_slots.add(self.selected_slot)
-                log_user_action("追跡開始", frame=self.current_frame_no(), slot=self.selected_slot, source="click")
-                self.refresh_mosaic_table()
-                self.trace_slot_range(self.selected_slot)
+                self.start_trace_with_length(self.selected_slot, source="click")
             return
         if col == 2:
             if self.selected_slot in self.trace_scale_slots:
@@ -3456,6 +3524,63 @@ class EditorWindow(QMainWindow):
             return int(self.current_row().get("frame_no", ""))
         except ValueError:
             return None
+
+    def start_trace_with_length(self, slot: int, source: str) -> None:
+        start_frame = self.current_frame_no()
+        if start_frame is None:
+            APP_LOGGER.warning("追跡開始失敗: 現在フレーム番号が不正 slot=%s", slot)
+            QMessageBox.warning(self, "Error", "現在フレーム番号が不正です")
+            self.refresh_mosaic_table()
+            return
+        if self.current_index >= len(self.data.rows) - 1:
+            APP_LOGGER.info("追跡開始不可: 最終フレーム slot=%s frame=%s", slot, start_frame)
+            QMessageBox.information(self, "追跡不可", "最終フレームのため、これ以上トレースできません。")
+            self.refresh_mosaic_table()
+            return
+
+        current_start, current_end = self.trace_range_for_slot(slot)
+        default_length = 1
+        if current_start == start_frame and current_end is not None:
+            default_length = max(1, min(999999, int(current_end) - start_frame))
+        length, ok = QInputDialog.getInt(
+            self,
+            "トレース長さ",
+            (
+                f"mosaic{slot} を現在フレーム {start_frame} から何フレーム先までトレースしますか？\n"
+                "途中で動体検出を見失った場合は、そのフレームをTrace Endにして停止します。"
+            ),
+            default_length,
+            1,
+            999999,
+            1,
+        )
+        if not ok:
+            log_user_action("追跡開始キャンセル", frame=start_frame, slot=slot, source=source)
+            self.refresh_mosaic_table()
+            return
+
+        end_index = min(len(self.data.rows) - 1, self.current_index + length)
+        try:
+            end_frame = int(self.data.rows[end_index].get("frame_no", ""))
+        except ValueError:
+            APP_LOGGER.warning("追跡開始失敗: End frame_no が不正 slot=%s index=%s", slot, end_index)
+            QMessageBox.warning(self, "Error", "End frame_no が不正です")
+            self.refresh_mosaic_table()
+            return
+
+        self.trace_ranges[slot] = (start_frame, end_frame)
+        self.trace_slots.add(slot)
+        self.selected_slot = slot
+        log_user_action(
+            "追跡開始",
+            frame=start_frame,
+            slot=slot,
+            source=source,
+            length=length,
+            requested_end=end_frame,
+        )
+        self.refresh_mosaic_table()
+        self.trace_slot_range(slot)
 
     def set_keep_range_start(self) -> None:
         frame_no = self.current_frame_no()
@@ -3725,72 +3850,131 @@ class EditorWindow(QMainWindow):
             self.refresh_mosaic_table()
             return
         label = self.data.rows[start_index].get(f"mosaic{slot}_type", "") or "manual"
+        original_anchor_frame = anchor_frame.copy()
+        original_anchor_rect = QRect(start_rect)
         anchor_index = start_index
         anchor_rect = QRect(start_rect)
+        total_trace_frames = max(1, end_index - start_index)
+        trace_started_at = time.monotonic()
+        progress = self.reusable_progress_dialog(
+            "フレーム追跡",
+            f"mosaic{slot}: {start_frame}-{end_frame} を追跡中...",
+            total_trace_frames,
+            cancelable=True,
+        )
         self.auto_track_status.setText(f"mosaic{slot}: {start_frame}-{end_frame} を追跡中...")
         QApplication.processEvents()
         stop_message = ""
         success_count = 0
+        final_end_frame = start_frame
         updated_start: int | None = None
         updated_end: int | None = None
-        for target_index in range(start_index + 1, end_index + 1):
-            gap = target_index - anchor_index - 1
-            if gap > self.max_interpolate_gap():
-                stop_message = f"mosaic{slot}: gap超過"
-                APP_LOGGER.warning("範囲追跡停止: slot=%s message=%s", slot, stop_message)
-                break
-            frame_no_text = self.data.rows[target_index].get("frame_no", "")
-            try:
-                target_frame_no = int(frame_no_text)
-            except ValueError:
-                stop_message = f"mosaic{slot}: frame_no不正"
-                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
-                break
-            next_frame = self.read_frame_number(target_frame_no, prefer_sequential=True)
-            if next_frame is None:
-                stop_message = f"mosaic{slot}: フレーム読込失敗"
-                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
-                break
-            result = track_rect_proxy(
-                anchor_frame,
-                next_frame,
-                anchor_rect,
-                allow_scale=self.trace_scale_enabled(slot),
-            )
-            if result is None:
-                stop_message = f"mosaic{slot}: 失敗"
-                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
-                break
-            tracked_rect, score, method = result
-            if not self.track_confident_enough(score, method):
-                stop_message = f"mosaic{slot}: 見失い(score={score:.3f})"
-                APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
-                break
-            tracked_rect = clamp_rect(tracked_rect, next_frame.shape[1], next_frame.shape[0])
-            span = max(1, target_index - anchor_index)
-            for idx in range(anchor_index + 1, target_index + 1):
-                t = (idx - anchor_index) / span
-                fill_rect = tracked_rect if idx == target_index else interpolate_rect(anchor_rect, tracked_rect, t)
-                target_row = self.data.rows[idx]
-                set_rect(target_row, slot, clamp_rect(fill_rect, next_frame.shape[1], next_frame.shape[0]), on=True)
-                target_row[f"mosaic{slot}_type"] = label
-                target_row[f"mosaic{slot}_score"] = f"track:{score:.3f}" if idx == target_index else "track:interpolated"
-                updated_start = idx if updated_start is None else min(updated_start, idx)
-                updated_end = idx if updated_end is None else max(updated_end, idx)
-            anchor_index = target_index
-            anchor_rect = QRect(tracked_rect)
-            anchor_frame = next_frame
-            success_count += 1
-            if success_count % 50 == 0:
-                frame_no = self.data.rows[target_index].get("frame_no", "")
-                self.auto_track_status.setText(f"mosaic{slot}: 範囲追跡中... frame {frame_no}")
-                QApplication.processEvents()
+        try:
+            for target_index in range(start_index + 1, end_index + 1):
+                processed_count = target_index - start_index
+                frame_no_text = self.data.rows[target_index].get("frame_no", "")
+                try:
+                    target_frame_no = int(frame_no_text)
+                except ValueError:
+                    stop_message = f"mosaic{slot}: frame_no不正"
+                    APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                    break
+                if processed_count == 1 or processed_count % 5 == 0 or processed_count == total_trace_frames:
+                    self.update_progress_dialog(
+                        progress,
+                        f"mosaic{slot}: frame {target_frame_no} を追跡中... {processed_count}/{total_trace_frames}",
+                        processed_count,
+                        total_trace_frames,
+                        trace_started_at,
+                    )
+                    if progress.wasCanceled():
+                        stop_message = f"mosaic{slot}: キャンセル"
+                        APP_LOGGER.info("範囲追跡キャンセル: slot=%s frame=%s", slot, target_frame_no)
+                        break
+                gap = target_index - anchor_index - 1
+                if gap > self.max_interpolate_gap():
+                    stop_message = f"mosaic{slot}: gap超過"
+                    APP_LOGGER.warning("範囲追跡停止: slot=%s message=%s", slot, stop_message)
+                    final_end_frame = target_frame_no
+                    break
+                next_frame = self.read_frame_number(target_frame_no, prefer_sequential=True)
+                if next_frame is None:
+                    stop_message = f"mosaic{slot}: フレーム読込失敗"
+                    APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                    final_end_frame = target_frame_no
+                    break
+                result = track_rect_proxy(
+                    anchor_frame,
+                    next_frame,
+                    anchor_rect,
+                    allow_scale=self.trace_scale_enabled(slot),
+                )
+                if result is None:
+                    stop_message = f"mosaic{slot}: 失敗"
+                    APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                    final_end_frame = target_frame_no
+                    break
+                tracked_rect, score, method = result
+                if not self.track_confident_enough(score, method):
+                    stop_message = f"mosaic{slot}: 見失い(score={score:.3f})"
+                    APP_LOGGER.warning("範囲追跡停止: slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                    final_end_frame = target_frame_no
+                    break
+                tracked_rect = clamp_rect(tracked_rect, next_frame.shape[1], next_frame.shape[0])
+                should_check_original = (
+                    processed_count == 1
+                    or processed_count % TRACE_ORIGINAL_TEMPLATE_INTERVAL == 0
+                    or processed_count == total_trace_frames
+                )
+                if should_check_original:
+                    original_score = template_similarity_score(
+                        original_anchor_frame,
+                        original_anchor_rect,
+                        next_frame,
+                        tracked_rect,
+                    )
+                    min_score = getattr(self, "trace_min_score", DEFAULT_TRACE_TO_END_MIN_SCORE)
+                    if original_score is not None and original_score < min_score:
+                        stop_message = f"mosaic{slot}: ドリフト検出(original={original_score:.3f})"
+                        APP_LOGGER.warning(
+                            "範囲追跡停止: slot=%s target_index=%s message=%s score=%.3f min=%.3f",
+                            slot,
+                            target_index,
+                            stop_message,
+                            original_score,
+                            min_score,
+                        )
+                        final_end_frame = target_frame_no
+                        break
+                span = max(1, target_index - anchor_index)
+                for idx in range(anchor_index + 1, target_index + 1):
+                    t = (idx - anchor_index) / span
+                    fill_rect = tracked_rect if idx == target_index else interpolate_rect(anchor_rect, tracked_rect, t)
+                    target_row = self.data.rows[idx]
+                    set_rect(target_row, slot, clamp_rect(fill_rect, next_frame.shape[1], next_frame.shape[0]), on=True)
+                    target_row[f"mosaic{slot}_type"] = label
+                    target_row[f"mosaic{slot}_score"] = f"track:{score:.3f}" if idx == target_index else "track:interpolated"
+                    updated_start = idx if updated_start is None else min(updated_start, idx)
+                    updated_end = idx if updated_end is None else max(updated_end, idx)
+                anchor_index = target_index
+                anchor_rect = QRect(tracked_rect)
+                anchor_frame = next_frame
+                final_end_frame = target_frame_no
+                success_count += 1
+                if success_count % 50 == 0:
+                    frame_no = self.data.rows[target_index].get("frame_no", "")
+                    self.auto_track_status.setText(f"mosaic{slot}: 範囲追跡中... frame {frame_no}")
+                    QApplication.processEvents()
+        finally:
+            progress.setValue(total_trace_frames if not stop_message else min(total_trace_frames, success_count + 1))
+            progress.hide()
         if not stop_message:
             stop_message = f"mosaic{slot}: 範囲追跡完了"
         self.trace_slots.discard(slot)
         self.auto_track_anchors.pop(slot, None)
-        self.auto_track_status.setText(f"{stop_message} / 更新 {success_count} frame")
-        log_user_action("範囲追跡終了", slot=slot, updated_frames=success_count, message=stop_message)
+        self.trace_ranges[slot] = (start_frame, final_end_frame)
+        self.auto_track_status.setText(f"{stop_message} / End {final_end_frame} / 更新 {success_count} frame")
+        log_user_action("範囲追跡終了", slot=slot, updated_frames=success_count, end=final_end_frame, message=stop_message)
         self.mark_dirty()
         if updated_start is not None and updated_end is not None:
             self.frame_table_model.refresh_rows(updated_start, updated_end)
@@ -3800,7 +3984,7 @@ class EditorWindow(QMainWindow):
     def track_confident_enough(self, score: float, method: str) -> bool:
         if "template" not in method:
             return False
-        return score >= TRACE_TO_END_MIN_SCORE
+        return score >= getattr(self, "trace_min_score", DEFAULT_TRACE_TO_END_MIN_SCORE)
 
     def max_interpolate_gap(self) -> int:
         try:
@@ -3816,14 +4000,28 @@ class EditorWindow(QMainWindow):
             APP_LOGGER.info("保存不可: レシピ未選択")
             QMessageBox.information(self, "未選択", "レシピが開かれていません。")
             return
-        if QMessageBox.question(self, "保存確認", f"{self.csv_path} を上書き保存しますか？") != QMessageBox.StandardButton.Yes:
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "レシピを保存",
+            str(self.csv_path),
+            "CSV (*.csv);;All files (*)",
+        )
+        if not selected:
             log_user_action("保存キャンセル", csv_path=self.csv_path)
             return
-        log_user_action("保存", csv_path=self.csv_path)
+        save_path = Path(selected)
+        if save_path.suffix.lower() != ".csv":
+            save_path = save_path.with_suffix(".csv")
+        if save_path.exists() and save_path != self.csv_path:
+            result = QMessageBox.question(self, "上書き確認", f"{save_path} は既に存在します。上書きしますか？")
+            if result != QMessageBox.StandardButton.Yes:
+                log_user_action("保存キャンセル", csv_path=self.csv_path, save_path=save_path)
+                return
+        log_user_action("保存", csv_path=self.csv_path, save_path=save_path)
         try:
-            self.save_current_recipe_with_progress("レシピを保存中...")
+            self.save_current_recipe_with_progress("レシピを保存中...", save_path=save_path)
         except Exception as exc:
-            APP_LOGGER.exception("保存失敗: csv=%s", self.csv_path)
+            APP_LOGGER.exception("保存失敗: csv=%s save_path=%s", self.csv_path, save_path)
             QMessageBox.critical(self, "Error", f"保存に失敗しました: {exc}")
             return
 
@@ -3842,9 +4040,11 @@ class EditorWindow(QMainWindow):
         message: str,
         progress_dialog: PostProgressDialog | None = None,
         refresh_table: bool = True,
+        save_path: Path | None = None,
     ) -> None:
         if self.csv_path is None:
             return
+        target_path = save_path or self.csv_path
         total_rows = len(self.data.rows)
         total_steps = max(1, total_rows * (3 if refresh_table else 2))
         started_at = time.monotonic()
@@ -3871,7 +4071,9 @@ class EditorWindow(QMainWindow):
                 )
 
         try:
-            write_pre_csv(self.csv_path, self.data, progress_callback=on_write_progress)
+            write_pre_csv(target_path, self.data, progress_callback=on_write_progress)
+            self.csv_path = target_path
+            self.remember_recipe_path(target_path)
             self.original_rows = [dict(row) for row in self.data.rows]
             self.dirty = False
             self.setWindowTitle(f"pre CSV Editor - {self.csv_path.name}")
