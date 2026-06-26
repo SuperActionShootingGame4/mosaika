@@ -1311,6 +1311,26 @@ def xywh_to_rect(x: int, y: int, width: int, height: int) -> QRect:
     return QRect(x, y, max(1, width), max(1, height))
 
 
+def csrt_available() -> bool:
+    """opencv-contrib の CSRT トラッカーが使えるか。"""
+    if hasattr(cv2, "TrackerCSRT_create"):
+        return True
+    legacy = getattr(cv2, "legacy", None)
+    return legacy is not None and hasattr(legacy, "TrackerCSRT_create")
+
+
+def create_csrt_tracker():
+    """CSRT トラッカーを生成する（OpenCV のバージョン差を吸収）。無ければ None。"""
+    if hasattr(cv2, "TrackerCSRT_create"):
+        return cv2.TrackerCSRT_create()
+    if hasattr(cv2, "TrackerCSRT"):
+        return cv2.TrackerCSRT.create()
+    legacy = getattr(cv2, "legacy", None)
+    if legacy is not None and hasattr(legacy, "TrackerCSRT_create"):
+        return legacy.TrackerCSRT_create()
+    return None
+
+
 class FrameTableModel(QAbstractTableModel):
     HEADERS = ["frame_no", "modify", "Keep", "Persons", "Mosaic", "Crotch", "comment"]
 
@@ -2465,6 +2485,7 @@ class EditorWindow(QMainWindow):
             0.0,
             1.0,
         )
+        self.csrt_trace = config_bool(load_editor_config(), "csrt_trace", True)
         self.auto_track_anchors: dict[int, tuple[int, QRect, np.ndarray, str]] = {}
         self.pose_model_bundle = None
         self.pose_model_error: str | None = None
@@ -2669,10 +2690,16 @@ class EditorWindow(QMainWindow):
         self.trace_min_score_spin.setSingleStep(0.05)
         self.trace_min_score_spin.setFixedWidth(70)
         self.trace_min_score_spin.setValue(self.trace_min_score)
+        self.csrt_trace_check = QCheckBox("CSRT追跡（白い車など低コントラスト対象に強い）")
+        self.csrt_trace_check.setChecked(self.csrt_trace and csrt_available())
+        self.csrt_trace_check.setEnabled(csrt_available())
+        if not csrt_available():
+            self.csrt_trace_check.setToolTip("opencv-contrib-python が必要です")
         meta_layout.addRow("intensity", intensity_layout)
         meta_layout.addRow("effect", self.effect_combo)
         meta_layout.addRow("shape", self.shape_combo)
         meta_layout.addRow("Trace min score", self.trace_min_score_spin)
+        meta_layout.addRow("", self.csrt_trace_check)
         for key in ("confidence", "pose_model", "yolo_nsfw_model", "interpolate_gap", "no_crotch", "skip_no_person"):
             meta_layout.addRow(key, QLabel(meta.get(key, "")))
         right_layout.addLayout(meta_layout)
@@ -2738,6 +2765,7 @@ class EditorWindow(QMainWindow):
         self.intensity_spin.valueChanged.connect(self.sync_intensity_slider)
         self.intensity_spin.valueChanged.connect(self.update_preview_meta)
         self.trace_min_score_spin.valueChanged.connect(self.update_trace_min_score)
+        self.csrt_trace_check.toggled.connect(self.update_csrt_trace)
         self.mosaic_table.cellClicked.connect(self.select_mosaic)
         self.mosaic_table.itemChanged.connect(self.update_mosaic_from_table)
         self.frame_table.clicked.connect(self.select_frame_row)
@@ -3549,6 +3577,17 @@ class EditorWindow(QMainWindow):
             APP_LOGGER.exception("追跡スコア閾値を保存できません: value=%s", value)
         log_user_action("追跡スコア閾値変更", value=self.trace_min_score)
 
+    def update_csrt_trace(self, enabled: bool) -> None:
+        self.csrt_trace = bool(enabled)
+        try:
+            save_editor_config_value("csrt_trace", self.csrt_trace)
+        except Exception:
+            APP_LOGGER.exception("CSRT追跡設定を保存できません: value=%s", enabled)
+        log_user_action("CSRT追跡設定変更", enabled=self.csrt_trace)
+
+    def csrt_trace_enabled(self) -> bool:
+        return bool(getattr(self, "csrt_trace", False)) and csrt_available()
+
     def frame_index_for_no(self, frame_no: int) -> int | None:
         for idx, row in enumerate(self.data.rows):
             try:
@@ -4052,6 +4091,12 @@ class EditorWindow(QMainWindow):
             self.refresh_mosaic_table()
             return
         label = self.data.rows[start_index].get(f"mosaic{slot}_type", "") or "manual"
+        # CSRT 追跡が有効なら専用ループに委譲する（白い車など低コントラスト対象に強い）。
+        if self.csrt_trace_enabled():
+            self._trace_slot_range_csrt(
+                slot, start_index, end_index, start_frame, end_frame, start_rect, anchor_frame, label
+            )
+            return
         # B1: ドリフト照合の基準を開始フレーム固定にせず、直近の信頼できた
         # フレームへ定期更新するローリング参照にする（緩やかな見た目変化を許容）。
         reference_frame = anchor_frame.copy()
@@ -4210,6 +4255,158 @@ class EditorWindow(QMainWindow):
         self.trace_ranges[slot] = (start_frame, final_end_frame)
         self.auto_track_status.setText(f"{stop_message} / End {final_end_frame} / 更新 {success_count} frame")
         log_user_action("範囲追跡終了", slot=slot, updated_frames=success_count, end=final_end_frame, message=stop_message)
+        self.mark_dirty()
+        if updated_start is not None and updated_end is not None:
+            self.frame_table_model.refresh_rows(updated_start, updated_end)
+        self.refresh_modified_markers()
+        self.load_frame()
+
+    def _trace_slot_range_csrt(
+        self,
+        slot: int,
+        start_index: int,
+        end_index: int,
+        start_frame: int,
+        end_frame: int,
+        start_rect: QRect,
+        anchor_frame: np.ndarray,
+        label: str,
+    ) -> None:
+        """CSRT トラッカーによる範囲追跡。色＋HOG＋空間信頼性を使い、白い車など
+        低コントラスト対象や背景への乗り移りに強い。処理は縮小画像で行う。"""
+        tracker = create_csrt_tracker()
+        if tracker is None:
+            self.trace_slots.discard(slot)
+            self.auto_track_status.setText(f"mosaic{slot}: CSRT が利用できません（opencv-contrib-python が必要）")
+            self.refresh_mosaic_table()
+            return
+        # T scale フラグ: F のときは枠サイズを開始時のまま固定し、中心だけ追従する。
+        allow_scale = self.trace_scale_enabled(slot)
+        h0, w0 = anchor_frame.shape[:2]
+        scale = min(1.0, TRACK_PROXY_MAX_DIM / max(1, max(h0, w0)))
+
+        def to_proxy(frame: np.ndarray) -> np.ndarray:
+            if scale >= 0.999:
+                return frame
+            return cv2.resize(
+                frame,
+                (max(1, round(w0 * scale)), max(1, round(h0 * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        proxy_start = to_proxy(anchor_frame)
+        ph_h, ph_w = proxy_start.shape[:2]
+        init_rect = scale_rect(start_rect, scale) if scale < 0.999 else QRect(start_rect)
+        px, py, pw, ph = rect_to_xywh(init_rect)
+        px = max(0, min(px, ph_w - 2))
+        py = max(0, min(py, ph_h - 2))
+        pw = max(2, min(pw, ph_w - px))
+        ph = max(2, min(ph, ph_h - py))
+        try:
+            tracker.init(proxy_start, (int(px), int(py), int(pw), int(ph)))
+        except cv2.error as exc:
+            APP_LOGGER.warning("CSRT init 失敗: slot=%s err=%s", slot, exc)
+            self.trace_slots.discard(slot)
+            self.auto_track_status.setText(f"mosaic{slot}: CSRT 初期化に失敗しました")
+            self.refresh_mosaic_table()
+            return
+        inv = 1.0 / scale if scale > 0 else 1.0
+        total_trace_frames = max(1, end_index - start_index)
+        trace_started_at = time.monotonic()
+        progress = self.reusable_progress_dialog(
+            "フレーム追跡",
+            f"mosaic{slot}: {start_frame}-{end_frame} を追跡中...(CSRT)",
+            total_trace_frames,
+            cancelable=True,
+        )
+        self.auto_track_status.setText(f"mosaic{slot}: {start_frame}-{end_frame} を追跡中...(CSRT)")
+        QApplication.processEvents()
+        stop_message = ""
+        success_count = 0
+        final_end_frame = start_frame
+        updated_start: int | None = None
+        updated_end: int | None = None
+        try:
+            for target_index in range(start_index + 1, end_index + 1):
+                processed_count = target_index - start_index
+                try:
+                    target_frame_no = int(self.data.rows[target_index].get("frame_no", ""))
+                except ValueError:
+                    stop_message = f"mosaic{slot}: frame_no不正"
+                    APP_LOGGER.warning("範囲追跡停止(CSRT): slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                    break
+                if processed_count == 1 or processed_count % 5 == 0 or processed_count == total_trace_frames:
+                    self.update_progress_dialog(
+                        progress,
+                        f"mosaic{slot}: frame {target_frame_no} を追跡中...(CSRT) {processed_count}/{total_trace_frames}",
+                        processed_count,
+                        total_trace_frames,
+                        trace_started_at,
+                    )
+                    if progress.wasCanceled():
+                        stop_message = f"mosaic{slot}: キャンセル"
+                        APP_LOGGER.info("範囲追跡キャンセル(CSRT): slot=%s frame=%s", slot, target_frame_no)
+                        break
+                next_frame = self.read_frame_number(target_frame_no, prefer_sequential=True)
+                if next_frame is None:
+                    stop_message = f"mosaic{slot}: フレーム読込失敗"
+                    final_end_frame = target_frame_no
+                    break
+                ok, box = tracker.update(to_proxy(next_frame))
+                if not ok:
+                    stop_message = f"mosaic{slot}: 見失い(CSRT)"
+                    APP_LOGGER.warning("範囲追跡停止(CSRT): slot=%s target_index=%s message=%s", slot, target_index, stop_message)
+                    final_end_frame = target_frame_no
+                    break
+                bx, by, bw, bh = box
+                tracked_rect = QRect(
+                    round(bx * inv), round(by * inv), max(1, round(bw * inv)), max(1, round(bh * inv))
+                )
+                if not allow_scale:
+                    # T scale = F: CSRT が推定した中心だけ使い、サイズは開始枠で固定する。
+                    center = tracked_rect.center()
+                    fixed_w, fixed_h = start_rect.width(), start_rect.height()
+                    tracked_rect = QRect(
+                        round(center.x() - fixed_w / 2),
+                        round(center.y() - fixed_h / 2),
+                        fixed_w,
+                        fixed_h,
+                    )
+                tracked_rect = clamp_rect(tracked_rect, next_frame.shape[1], next_frame.shape[0])
+                scale_w = tracked_rect.width() / max(1, start_rect.width())
+                scale_h = tracked_rect.height() / max(1, start_rect.height())
+                if (
+                    max(scale_w, scale_h) > TRACE_MAX_SCALE_RATIO
+                    or min(scale_w, scale_h) < TRACE_MIN_SCALE_RATIO
+                ):
+                    stop_message = f"mosaic{slot}: スケールドリフト(倍率 w={scale_w:.2f}, h={scale_h:.2f})"
+                    APP_LOGGER.warning(
+                        "範囲追跡停止(CSRT): slot=%s target_index=%s message=%s scale_w=%.3f scale_h=%.3f",
+                        slot, target_index, stop_message, scale_w, scale_h,
+                    )
+                    final_end_frame = target_frame_no
+                    break
+                target_row = self.data.rows[target_index]
+                set_rect(target_row, slot, tracked_rect, on=True)
+                target_row[f"mosaic{slot}_type"] = label
+                target_row[f"mosaic{slot}_score"] = "track:csrt"
+                updated_start = target_index if updated_start is None else min(updated_start, target_index)
+                updated_end = target_index if updated_end is None else max(updated_end, target_index)
+                final_end_frame = target_frame_no
+                success_count += 1
+                if success_count % 50 == 0:
+                    self.auto_track_status.setText(f"mosaic{slot}: 範囲追跡中...(CSRT) frame {target_frame_no}")
+                    QApplication.processEvents()
+        finally:
+            progress.setValue(total_trace_frames if not stop_message else min(total_trace_frames, success_count + 1))
+            progress.hide()
+        if not stop_message:
+            stop_message = f"mosaic{slot}: 範囲追跡完了(CSRT)"
+        self.trace_slots.discard(slot)
+        self.auto_track_anchors.pop(slot, None)
+        self.trace_ranges[slot] = (start_frame, final_end_frame)
+        self.auto_track_status.setText(f"{stop_message} / End {final_end_frame} / 更新 {success_count} frame")
+        log_user_action("範囲追跡終了", slot=slot, updated_frames=success_count, end=final_end_frame, message=stop_message, tracker="csrt")
         self.mark_dirty()
         if updated_start is not None and updated_end is not None:
             self.frame_table_model.refresh_rows(updated_start, updated_end)

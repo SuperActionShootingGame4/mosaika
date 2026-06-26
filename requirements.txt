@@ -1,5 +1,6 @@
 nudenet>=3.4.0
-opencv-python>=4.8.0
+# CSRT 追跡（pre_csv_editor の動体トレース）に contrib 版が必要
+opencv-contrib-python>=4.8.0
 tqdm>=4.65.0
 numpy>=1.24.0
 ultralytics>=8.3.0
